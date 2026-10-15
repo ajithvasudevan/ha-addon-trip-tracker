@@ -1,0 +1,66 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+  <title>Trip Tracker</title>
+  <link rel="stylesheet" href="static/vendor/leaflet.css">
+  <link rel="stylesheet" href="static/vendor/maplibre-gl.css">
+  <link rel="stylesheet" href="static/app.css">
+</head>
+<body>
+  <div id="app">
+    <aside id="panel">
+      <div class="panel-head">
+        <h1>🗺️ Trip Tracker <a id="popout" href="#" target="_blank" rel="noopener" title="Open in a new window">⇱</a></h1>
+        <button id="panel-toggle" title="Hide panel">◂</button>
+      </div>
+
+      <div id="active-box" class="box"></div>
+
+      <div class="box">
+        <label class="row basemap-row">🗺️ Basemap
+          <select id="basemap"></select>
+        </label>
+      </div>
+
+      <div id="start-box" class="box">
+        <h2>Start a trip</h2>
+        <input id="trip-name" type="text" placeholder="Trip name (optional)">
+        <label class="row">Send interval <span id="iv-label">15</span> s
+          <input id="trip-interval" type="range" min="2" max="120" value="15">
+        </label>
+        <button id="btn-start" class="primary">▶ Start Trip</button>
+        <button id="btn-stop" class="danger" hidden>■ Stop Trip</button>
+      </div>
+
+      <div class="box grow">
+        <h2>Trips</h2>
+        <ul id="trip-list"></ul>
+      </div>
+
+      <div class="box small" id="cfg-box"></div>
+    </aside>
+
+    <main id="mapwrap">
+      <div id="map"></div>
+      <div id="gmap"></div>
+      <button id="panel-show" title="Show panel">▸</button>
+      <div id="balloon" class="hidden"></div>
+    </main>
+  </div>
+
+  <div id="lightbox" class="lb-hidden" aria-hidden="true">
+    <button id="lb-prev" class="lb-nav" title="Previous (←)">‹</button>
+    <img id="lb-img" alt="">
+    <button id="lb-next" class="lb-nav" title="Next (→)">›</button>
+    <button id="lb-close" title="Close (Esc)">✕</button>
+    <a id="lb-orig" href="#" target="_blank" rel="noopener">Open original ↗</a>
+  </div>
+
+  <script src="static/vendor/leaflet.js"></script>
+  <script src="static/vendor/maplibre-gl.js"></script>
+  <script src="static/vendor/leaflet-maplibre-gl.js"></script>
+  <script src="static/app.js"></script>
+</body>
+</html>
