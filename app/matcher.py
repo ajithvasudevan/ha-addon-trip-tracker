@@ -76,7 +76,8 @@ def capture_epoch(asset):
 
 
 def fetch_assets(base_url, api_key, after_iso, before_iso, page_size=1000, max_pages=50, timeout=30):
-    """All IMAGE assets taken in [after_iso, before_iso] via immich search/metadata."""
+    """All assets (photos AND videos) taken in [after_iso, before_iso] via immich search/metadata.
+    Omitting `type` returns both IMAGE and VIDEO; the caller reads each item's `type`."""
     url = f"{base_url}/api/search/metadata"
     headers = {"x-api-key": api_key, "Content-Type": "application/json"}
     out, page = [], 1
@@ -85,7 +86,7 @@ def fetch_assets(base_url, api_key, after_iso, before_iso, page_size=1000, max_p
             "takenAfter": after_iso,
             "takenBefore": before_iso,
             "withExif": True,
-            "type": "IMAGE",
+            "withPeople": True,   # so each asset carries its `people` list (for the photo filter)
             "size": page_size,
             "page": page,
         }

@@ -16,7 +16,9 @@ body {
   font-family: -apple-system, "Segoe UI", Roboto, system-ui, sans-serif;
   background: var(--bg); color: var(--fg);
 }
-#app { display: flex; height: 100vh; width: 100vw; position: relative; }
+/* height/width:100% (not 100vh/100vw) so the layout tracks the actual box — inside the HA ingress iframe
+   100vh mis-resolves on mobile, which collapsed the flex children. html+body are already height:100%. */
+#app { display: flex; height: 100%; width: 100%; position: relative; }
 
 #panel {
   width: 330px; min-width: 330px; height: 100%;
@@ -25,6 +27,34 @@ body {
   overflow-y: auto;
 }
 body.collapsed #panel { display: none; }        /* desktop: collapse hides it, map fills */
+
+/* side-panel tabs: "Trips" (everything) + "Start a trip". Viewers don't see the tab bar (no start tab). */
+#panel-tabs { display: flex; gap: 6px; }
+.ptab {
+  flex: 1; width: auto; padding: 8px 10px; font-size: 13px; font-weight: 600;
+  background: var(--box); color: var(--muted); border: 1px solid var(--line); border-radius: 8px;
+}
+.ptab:hover { color: var(--fg); }
+.ptab.active { background: var(--accent); color: #fff; border-color: var(--accent); }
+.ptab.active:hover { background: var(--accent2); }
+.ptab-page { display: flex; flex-direction: column; gap: 10px; flex: 1 1 auto; min-height: 0; }
+.ptab-page[hidden] { display: none; }
+body.viewer #tab-start-btn { display: none; }    /* viewers: Trips + Filter tabs only (no "Start a trip") */
+
+/* photo filter (People / Camera) */
+.filter-list { display: flex; flex-direction: column; gap: 6px; max-height: 40vh; overflow-y: auto; }
+.filter-item { display: flex; align-items: center; gap: 8px; font-size: 13px; color: var(--fg); cursor: pointer; }
+.filter-item input { flex: 0 0 auto; }
+.filter-empty { font-size: 12px; color: var(--muted); }
+#filter-clear { background: #30363d; }
+
+/* Start-a-trip tab fills the panel height with its controls comfortably spaced; actions anchored at the bottom */
+.ptab-page[data-page="start"] #start-box { flex: 1; display: flex; flex-direction: column; gap: 16px; }
+.ptab-page[data-page="start"] #start-box h2 { margin: 0; }
+.ptab-page[data-page="start"] #start-box input[type=text] { margin: 0; }
+.ptab-page[data-page="start"] #start-box label.row { margin: 0; }
+.start-actions { margin-top: auto; display: flex; flex-direction: column; gap: 10px; }
+.start-actions button { margin: 0; }
 
 .panel-head { display: flex; align-items: center; justify-content: space-between; gap: 6px; }
 #panel h1 { font-size: 18px; margin: 2px 0 4px; }
@@ -56,6 +86,7 @@ input[type=text] {
   border: 1px solid var(--line); background: #0e141d; color: var(--fg); font-size: 14px;
 }
 label.row { display: flex; align-items: center; gap: 8px; font-size: 13px; color: var(--muted); margin-bottom: 10px; }
+label.row[hidden] { display: none; }   /* the `display:flex` above otherwise overrides the UA [hidden] rule */
 label.row input[type=range] { flex: 1; }
 label.row.basemap-row { margin: 0; }
 #basemap {
@@ -77,6 +108,8 @@ button.danger { background: var(--danger); }
 #trip-list li.sel { border-color: var(--accent2); background: #0e1a2b; }
 .t-main { flex: 1; cursor: pointer; min-width: 0; }
 .t-main b { font-size: 14px; }
+/* per-trip track-colour swatch shown before the name */
+.t-swatch { display: inline-block; width: 11px; height: 11px; border-radius: 3px; margin-right: 6px; border: 1px solid rgba(255,255,255,.25); }
 .t-sub { font-size: 11px; color: var(--muted); margin-top: 2px; }
 .t-act { display: flex; gap: 2px; }
 .t-act button { width: auto; padding: 4px 7px; background: transparent; font-size: 13px; }
@@ -90,13 +123,26 @@ button.danger { background: var(--danger); }
 body.viewer #active-box, body.viewer #start-box, body.viewer #cfg-box { display: none; }
 body.viewer .t-act { display: none; }
 
+/* colour pickers (start form + edit dialog) */
+input[type=color] { width: 46px; height: 30px; padding: 0; border: 1px solid var(--line); border-radius: 6px; background: #0e141d; cursor: pointer; }
+
+/* trip edit dialog */
+#edit-modal { position: fixed; inset: 0; z-index: 4000; background: rgba(0,0,0,.6); display: flex; align-items: center; justify-content: center; padding: 16px; }
+#edit-modal.modal-hidden { display: none; }
+.modal-card { width: 100%; max-width: 360px; background: var(--panel); border: 1px solid var(--line); border-radius: 12px; padding: 16px; display: flex; flex-direction: column; gap: 14px; box-shadow: 0 10px 40px rgba(0,0,0,.6); }
+.modal-card h2 { margin: 0; font-size: 15px; }
+.modal-card label.row { margin: 0; }
+.modal-card label.row input[type=text] { flex: 1; width: auto; margin: 0; }
+.modal-actions { display: flex; gap: 8px; justify-content: flex-end; }
+.modal-actions button { width: auto; padding: 8px 16px; }
+
 /* map containers (one visible at a time; JS toggles display) */
 #mapwrap { flex: 1; position: relative; height: 100%; min-width: 0; }
 #map, #gmap { position: absolute; inset: 0; }
 #gmap { display: none; }
 
-#popout { text-decoration: none; font-size: 15px; color: var(--muted); margin-left: 4px; }
-#popout:hover { color: var(--fg); }
+#popout, #reload { text-decoration: none; font-size: 15px; color: var(--muted); margin-left: 4px; cursor: pointer; }
+#popout:hover, #reload:hover { color: var(--fg); }
 
 /* locate FAB (Leaflet) + native-style locate control (Google) */
 .tt-locate, .g-locate {
@@ -107,54 +153,140 @@ body.viewer .t-act { display: none; }
 .tt-locate { margin: 10px; }
 .g-locate { margin: 10px; }
 .tt-locate:hover, .g-locate:hover { background: #eef3f9; }
+/* active = follow mode engaged (map keeps re-centring on the traveler) */
+.tt-locate.following, .g-locate.following { background: #1565c0; color: #fff; }
+.tt-locate.following:hover, .g-locate.following:hover { background: #3b82f6; }
+
+/* track-point click popup (speed + coords) */
+.tk-pop { position: relative; font-size: 12px; line-height: 1.5; color: #222; white-space: nowrap; padding-right: 22px; }
+.tk-pop b { font-size: 15px; }
+.tk-pop span { color: #666; }
+/* our own small SQUARE close button, at the popup's top-right corner */
+.tk-x {
+  position: absolute; top: 0; right: 0; width: 18px; height: 18px; box-sizing: border-box;
+  display: flex; align-items: center; justify-content: center;
+  border: 1px solid #ccc; border-radius: 3px; background: #fff; color: #555;
+  font-size: 14px; line-height: 1; padding: 0; cursor: pointer;
+  -webkit-tap-highlight-color: transparent; outline: none;
+}
+.tk-x:hover { background: #f0f0f0; color: #000; }
+/* hide the engines' native close buttons — we render our own .tk-x */
+.gm-style .gm-ui-hover-effect { display: none !important; }
 
 /* photo marker */
 .cam-marker { font-size: 20px; line-height: 26px; text-align: center; filter: drop-shadow(0 1px 2px rgba(0,0,0,.6)); }
+/* current-location head indicator (dot when still, speed-coloured arrow when moving) — no default div box */
+.tt-head { background: transparent; border: 0; }
+.tt-head svg { display: block; filter: drop-shadow(0 1px 2px rgba(0,0,0,.5)); }
 
-/* photo balloon (custom overlay, engine-independent, centred so ‹ › stay put across navigations) */
-#balloon { position: absolute; left: 50%; top: 50%; z-index: 1500; transform: translate(-50%, calc(-100% - 18px)); pointer-events: none; }
-#balloon.hidden { display: none; }
-.bl-bubble { position: relative; width: 300px; max-width: 82vw; background: #fff; border-radius: 10px; box-shadow: 0 6px 22px rgba(0,0,0,.55); overflow: hidden; pointer-events: auto; }
-.bl-imgwrap { position: relative; line-height: 0; }
-.bl-img { display: block; width: 100%; height: auto; }
-.bl-nav {
-  position: absolute; top: 0; bottom: 0; width: 50%; border: none; background: transparent; color: #fff;
-  font-size: 46px; line-height: 1; cursor: pointer; opacity: .82; display: flex; align-items: center;
-  text-shadow: 0 1px 5px rgba(0,0,0,.9); -webkit-tap-highlight-color: transparent;
+/* live speed overlay (shown only while viewing the active trip) */
+#speed-overlay {
+  position: absolute; top: 10px; left: 50%; transform: translateX(-50%); z-index: 1200;
+  display: flex; align-items: baseline; gap: 4px; pointer-events: none;
+  background: rgba(0,0,0,.66); color: #fff; padding: 6px 14px; border-radius: 20px;
+  font-size: 22px; font-weight: 700; line-height: 1; box-shadow: 0 1px 6px rgba(0,0,0,.45);
+  font-variant-numeric: tabular-nums;
+  text-shadow: 0 1px 3px rgba(0,0,0,.9);   /* keep digits legible as the background fades with staleness */
+  transition: background .5s linear;
 }
-.bl-prev { left: 0; justify-content: flex-start; padding-left: 4px; }
-.bl-next { right: 0; justify-content: flex-end; padding-right: 4px; }
-.bl-nav.off { opacity: .2; }
-.bl-meta { font-size: 12px; color: #333; padding: 7px 9px; line-height: 1.4; }
-.bl-meta .badge { display: inline-block; padding: 1px 6px; border-radius: 10px; background: #e0e7ff; color: #1e3a8a; font-weight: 600; font-size: 11px; }
-.bl-full { display: block; width: 100%; border: none; background: #1565c0; color: #fff; padding: 7px; font-size: 12px; font-weight: 600; cursor: pointer; }
-.bl-full:hover { background: #3b82f6; }
-.bl-x { position: absolute; top: 5px; right: 5px; z-index: 3; width: 24px; height: 24px; border-radius: 50%; background: rgba(0,0,0,.5); color: #fff; font-size: 13px; line-height: 1; border: none; cursor: pointer; padding: 0; }
-.bl-tail { position: absolute; left: 50%; bottom: -12px; transform: translateX(-50%); width: 0; height: 0; border-left: 11px solid transparent; border-right: 11px solid transparent; border-top: 13px solid #fff; filter: drop-shadow(0 3px 2px rgba(0,0,0,.3)); }
+#speed-overlay.hidden { display: none; }
+#speed-overlay small { font-size: 12px; font-weight: 600; opacity: .85; }
 
-/* full-screen photo lightbox */
-#lightbox { position: fixed; inset: 0; z-index: 3000; background: rgba(0,0,0,.95); display: flex; align-items: center; justify-content: center; }
+/* photo dock: a docked viewer — right 40% on desktop, bottom 40% on mobile (see the media query).
+   The image fills the stage with object-fit:contain → no borders on at least one axis. */
+#photodock { display: none; position: relative; background: #000; min-width: 0; min-height: 0; overflow: hidden; }
+body.pv-open #photodock { display: block; flex: 0 0 40%; }          /* desktop: right 40% of the viewport */
+#pv-stage { position: absolute; inset: 0; touch-action: none; }   /* whole-stage gesture surface (incl. letterbox) */
+/* pan/pinch-zoomable: touch-action:none so our gesture handlers get the moves instead of the page scrolling */
+/* transparent bg (not #000) so letterbox shows the black #photodock behind — needed so the sliding ghost's
+   letterbox doesn't occlude the current image when the two are packed tight during a swipe */
+#pv-img { width: 100%; height: 100%; object-fit: contain; display: block; background: transparent;
+  cursor: zoom-in; touch-action: none; user-select: none; -webkit-user-select: none; -webkit-user-drag: none; }
+/* "ghost" neighbour image that slides in during a swipe (from the preloaded cache); clipped by #photodock */
+#pv-ghost { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: contain; background: transparent;
+  display: none; z-index: 2; pointer-events: none; will-change: transform; }
+#pv-meta {
+  position: absolute; left: 0; right: 0; bottom: 0; z-index: 4; pointer-events: none;
+  padding: 6px 10px; font-size: 12px; line-height: 1.4; color: #fff;
+  background: linear-gradient(0deg, rgba(0,0,0,.62), transparent); overflow-wrap: anywhere;
+}
+#pv-meta span, #lb-meta span { color: #cfd8e3; }
+#pv-meta .flt, #lb-meta .flt { color: #ffd400; font-weight: 700; }   /* term matching the active filter → highlighted */
+#pv-play {
+  position: absolute; left: 50%; top: 50%; transform: translate(-50%, -50%); z-index: 3; pointer-events: none;
+  width: 60px; height: 60px; border-radius: 50%; background: rgba(0,0,0,.5); color: #fff; font-size: 28px;
+  display: flex; align-items: center; justify-content: center; padding-left: 5px;
+}
+#pv-play[hidden] { display: none; }
+/* overlay full-screen + close buttons (top-right of the dock) */
+#pv-full, #pv-close {
+  position: absolute; top: 8px; z-index: 6; width: 36px; height: 36px; padding: 0; border: none; border-radius: 8px;
+  background: rgba(0,0,0,.5); color: #fff; font-size: 18px; line-height: 1; cursor: pointer;
+  display: flex; align-items: center; justify-content: center; -webkit-tap-highlight-color: transparent;
+}
+#pv-full { right: 50px; }
+#pv-close { right: 8px; }
+#pv-full:hover, #pv-close:hover { background: rgba(0,0,0,.75); }
+
+/* nav buttons — shared by the dock (.pv-nav) and the fullscreen overlay (.lb-nav): flush to the view's
+   left/right edge, vertically centred, overlaid on the photo, NO margin (req) */
+.pv-nav, .lb-nav {
+  position: absolute; top: 50%; transform: translateY(-50%); margin: 0; padding: 0; border: none;
+  width: 46px; height: 68px; z-index: 5; cursor: pointer;
+  display: flex; align-items: center; justify-content: center;
+  background: rgba(0,0,0,.4); color: #fff; font-size: 38px; line-height: 1;
+  text-shadow: 0 1px 5px rgba(0,0,0,.9); -webkit-tap-highlight-color: transparent; user-select: none;
+  transition: opacity .3s ease, background .15s ease;
+}
+.pv-nav:hover, .lb-nav:hover { background: rgba(0,0,0,.6); }
+.pv-prev, #lb-prev { left: 0; }
+.pv-next, #lb-next { right: 0; }
+.pv-nav.off, .lb-nav.lb-nav-off { opacity: .22; cursor: default; }
+.pv-nav.off:hover, .lb-nav.lb-nav-off:hover { background: rgba(0,0,0,.4); }
+/* auto-hidden (faded) after 2s; pointer-events:none so a tap where an arrow was falls through and re-shows it */
+body.nav-hidden .pv-nav, body.nav-hidden .lb-nav { opacity: 0; pointer-events: none; }
+
+/* transient shield (see index.html): on for ~300ms after a gesture-close, eats the leftover tap so the map
+   under where the overlay was doesn't fire its own double-tap zoom / pan. Below the lightbox, above the map. */
+#tap-shield { position: fixed; inset: 0; z-index: 2900; display: none; background: transparent; touch-action: none; }
+#tap-shield.on { display: block; }
+
+/* full-screen photo overlay (a cancellable overlay; its nav buttons share the .lb-nav rules above) */
+#lightbox { position: fixed; inset: 0; z-index: 3000; background: #000; display: flex; align-items: center; justify-content: center; overflow: hidden; touch-action: none; }
 #lightbox.lb-hidden { display: none; }
-#lb-img { max-width: 100vw; max-height: 100vh; object-fit: contain; }
+#lb-img, #lb-video { max-width: 100vw; max-height: 100vh; object-fit: contain; }
+/* fullscreen image is pan/pinch-zoomable too (video keeps its native controls) */
+#lb-img { touch-action: none; user-select: none; -webkit-user-select: none; -webkit-user-drag: none;
+  will-change: transform; transform-origin: center center; cursor: default; }
+/* fullscreen swipe "ghost": absolutely centred like #lb-img, slides in from the edge during a swipe */
+#lb-ghost { position: absolute; left: 0; right: 0; top: 0; bottom: 0; margin: auto; max-width: 100vw; max-height: 100vh;
+  object-fit: contain; display: none; z-index: 2; pointer-events: none; will-change: transform; }
 #lb-close { position: absolute; top: 14px; right: 18px; z-index: 10; width: 44px; height: 44px; border-radius: 50%; background: rgba(255,255,255,.16); color: #fff; font-size: 22px; line-height: 1; border: none; cursor: pointer; }
 #lb-close:hover { background: rgba(255,255,255,.32); }
-#lb-orig { position: absolute; bottom: 16px; left: 50%; transform: translateX(-50%); z-index: 10; color: #fff; font-size: 13px; opacity: .85; text-decoration: underline; }
-.lb-nav { position: absolute; top: 0; bottom: 0; width: 50%; z-index: 5; border: none; cursor: pointer; background: transparent; color: #fff; font-size: 72px; line-height: 1; opacity: .5; display: flex; align-items: center; user-select: none; -webkit-tap-highlight-color: transparent; transition: opacity .15s ease, background .15s ease; text-shadow: 0 1px 6px rgba(0,0,0,.8); }
-#lb-prev { left: 0; justify-content: flex-start; padding-left: 2.5vw; }
-#lb-next { right: 0; justify-content: flex-end; padding-right: 2.5vw; }
-#lb-prev:hover { opacity: 1; background: linear-gradient(90deg, rgba(0,0,0,.42), transparent 55%); }
-#lb-next:hover { opacity: 1; background: linear-gradient(270deg, rgba(0,0,0,.42), transparent 55%); }
-.lb-nav.lb-nav-off { opacity: .12; cursor: default; }
-.lb-nav.lb-nav-off:hover { background: transparent; }
+/* moved to the TOP-left so the bottom edge is free for the caption */
+#lb-orig { position: absolute; top: 16px; left: 18px; z-index: 10; color: #fff; font-size: 13px; opacity: .85; text-decoration: underline; }
+/* fullscreen caption: same info as the dock, anchored to the very bottom edge; extra lines grow UP into the
+   letterbox and, if long enough, over the photo (text-shadow keeps it legible there) */
+#lb-meta {
+  position: absolute; left: 0; right: 0; bottom: 0; z-index: 6; pointer-events: none;
+  padding: 10px 14px; font-size: 13px; line-height: 1.5; color: #fff; overflow-wrap: anywhere;
+  background: linear-gradient(0deg, rgba(0,0,0,.72), rgba(0,0,0,.35) 55%, transparent);
+  text-shadow: 0 1px 3px rgba(0,0,0,.95);
+}
+#lightbox.lb-hidden #lb-meta { display: none; }
 
 /* mobile/narrow: panel becomes a slide-in overlay so the map + its controls always fill the screen */
-@media (max-width: 820px) {
-  #panel {
-    position: absolute; top: 0; left: 0; bottom: 0; z-index: 1100;
-    width: 85vw; max-width: 320px; min-width: 0;        /* override the 330px desktop min-width */
-    box-shadow: 2px 0 14px rgba(0,0,0,.6);
-  }
-  #mapwrap { width: 100%; }                              /* map fills; panel floats over it */
-  body.collapsed #panel { display: none; }
-  body:not(.collapsed) #panel { display: flex; }
+/* Portrait layout (JS toggles body.portrait from the REAL #app box, so it works on phones even inside the
+   HA ingress iframe, where a px media query mis-reads the width as "desktop"): map on top, dock at the bottom.
+   Landscape (no class) keeps the default row layout: 330px panel · map · right-40% dock. */
+body.portrait #app { flex-direction: column; }
+body.portrait #panel {
+  position: absolute; top: 0; left: 0; bottom: 0; z-index: 1100;
+  width: 85vw; max-width: 320px; min-width: 0;          /* override the 330px desktop min-width */
+  box-shadow: 2px 0 14px rgba(0,0,0,.6);
 }
+/* Explicit heights, NOT flex-grow: the map's children are absolutely-positioned so #mapwrap has no intrinsic
+   height, and leaning on flex-grow collapsed it to 0 inside the ingress iframe. Percentages of #app are definite. */
+body.portrait #mapwrap { flex: none; width: 100%; height: 100%; min-height: 0; } /* dock closed → full height */
+body.portrait.pv-open #mapwrap { height: 60%; }                                  /* dock open → top 60% */
+body.portrait.pv-open #photodock { flex: none; height: 40%; width: 100%; }       /* dock open → bottom 40% */

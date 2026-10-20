@@ -130,7 +130,10 @@ CREATE TABLE IF NOT EXISTS trips.trip (
   started_at  timestamptz NOT NULL DEFAULT now(),
   stopped_at  timestamptz,
   active      boolean NOT NULL DEFAULT true,
-  interval_s  integer NOT NULL DEFAULT 15,
+  interval_s  integer NOT NULL DEFAULT 5,
+  mode        text NOT NULL DEFAULT 'time',
+  min_distance_m integer,
+  color       text,
   created_at  timestamptz NOT NULL DEFAULT now()
 );
 CREATE TABLE IF NOT EXISTS trips.track_point (
@@ -155,10 +158,20 @@ CREATE TABLE IF NOT EXISTS trips.photo (
   lon               double precision,
   matched_by        text,
   original_filename text,
+  media_type        text NOT NULL DEFAULT 'image',
+  camera            text,
+  people            text,
   processed_at      timestamptz NOT NULL DEFAULT now(),
   UNIQUE (trip_id, immich_asset_id)
 );
 CREATE INDEX IF NOT EXISTS photo_trip_idx ON trips.photo(trip_id, id);
+-- upgrade older installs (columns added after first release)
+ALTER TABLE trips.trip ADD COLUMN IF NOT EXISTS mode text NOT NULL DEFAULT 'time';
+ALTER TABLE trips.trip ADD COLUMN IF NOT EXISTS min_distance_m integer;
+ALTER TABLE trips.trip ADD COLUMN IF NOT EXISTS color text;
+ALTER TABLE trips.photo ADD COLUMN IF NOT EXISTS media_type text NOT NULL DEFAULT 'image';
+ALTER TABLE trips.photo ADD COLUMN IF NOT EXISTS camera text;
+ALTER TABLE trips.photo ADD COLUMN IF NOT EXISTS people text;
 """
 
 
@@ -200,7 +213,7 @@ def default_name():
 
 def get_active_trip():
     return dbx(
-        "SELECT id,name,started_at,stopped_at,active,interval_s FROM trips.trip "
+        "SELECT id,name,started_at,stopped_at,active,interval_s,mode,min_distance_m,color FROM trips.trip "
         "WHERE active=true ORDER BY id DESC LIMIT 1",
         fetch="one",
         dict_cur=True,
@@ -214,29 +227,49 @@ def trip_public(r):
     for k in ("started_at", "stopped_at", "created_at"):
         if d.get(k) is not None:
             d[k] = iso(d[k])
-    for k in ("id", "interval_s", "points", "photos"):
+    for k in ("id", "interval_s", "min_distance_m", "points", "photos"):
         if d.get(k) is not None:
             d[k] = int(d[k])
     return d
 
 
 # --------------------------------------------------------------------------- trip lifecycle
-def start_trip(name, interval_s, origin):
+def norm_mode(mode):
+    m = str(mode or "").strip().lower()
+    return m if m in ("time", "distance", "hybrid") else "hybrid"
+
+
+def start_trip(name, interval_s, origin, mode="hybrid", min_distance_m=None, color=None):
+    mode = norm_mode(mode)
+    color = (str(color).strip() or None) if color else None
+    if not color:
+        color = "#1565c0"
+    if mode in ("distance", "hybrid"):   # both use the distance threshold
+        try:
+            min_distance_m = int(min_distance_m)
+        except (TypeError, ValueError):
+            min_distance_m = 25
+        if min_distance_m < 1:
+            min_distance_m = 25
+    else:
+        min_distance_m = None
     dbx("UPDATE trips.trip SET active=false, stopped_at=COALESCE(stopped_at, now()) WHERE active=true")
     row = dbx(
-        "INSERT INTO trips.trip(name, interval_s, active) VALUES (%s,%s,true) "
-        "RETURNING id,name,started_at,stopped_at,active,interval_s",
-        (name or default_name(), interval_s),
+        "INSERT INTO trips.trip(name, interval_s, mode, min_distance_m, color, active) VALUES (%s,%s,%s,%s,%s,true) "
+        "RETURNING id,name,started_at,stopped_at,active,interval_s,mode,min_distance_m,color",
+        (name or default_name(), interval_s, mode, min_distance_m, color),
         fetch="one",
         dict_cur=True,
     )
     publish_state()
     # nudge the phone to begin sending (source=addon so our own echo is ignored)
-    mqtt_publish(
-        f"{BASE}/control",
-        {"cmd": "start", "trip_id": row["id"], "name": row["name"], "interval_s": interval_s, "source": "addon"},
-    )
-    log.info("trip START id=%s name=%s interval=%ss origin=%s", row["id"], row["name"], interval_s, origin)
+    ctrl = {"cmd": "start", "trip_id": row["id"], "name": row["name"],
+            "interval_s": interval_s, "mode": mode, "source": "addon"}
+    if min_distance_m is not None:
+        ctrl["min_distance_m"] = min_distance_m
+    mqtt_publish(f"{BASE}/control", ctrl)
+    log.info("trip START id=%s name=%s mode=%s interval=%ss dist=%sm origin=%s",
+             row["id"], row["name"], mode, interval_s, min_distance_m, origin)
     return row
 
 
@@ -257,6 +290,28 @@ def _safe_sync(trip_id):
         sync_photos(trip_id)
     except Exception as e:
         log.warning("sync_photos(%s) failed: %s", trip_id, e)
+
+
+def _camera_of(a):
+    ex = a.get("exifInfo") or {}
+    make = (ex.get("make") or "").strip()
+    model = (ex.get("model") or "").strip()
+    # some phones repeat the make inside the model ("OnePlus" + "OnePlus 13s") — don't double it
+    if make and model and model.lower().startswith(make.lower()):
+        cam = model
+    else:
+        cam = (make + " " + model).strip()
+    return cam or None
+
+
+def _people_of(a):
+    out, seen = [], set()
+    for p in (a.get("people") or []):
+        n = (p.get("name") or "").strip()
+        if n and n not in seen:
+            seen.add(n)
+            out.append(n)
+    return json.dumps(out) if out else None
 
 
 def sync_photos(trip_id):
@@ -285,7 +340,14 @@ def sync_photos(trip_id):
     added = 0
     for a in assets:
         aid = a.get("id")
-        if not aid or aid in existing:
+        if not aid:
+            continue
+        cam, ppl = _camera_of(a), _people_of(a)
+        if aid in existing:
+            # already synced → backfill camera/people on rows that predate those columns (cheap: only when null)
+            dbx("UPDATE trips.photo SET camera=COALESCE(camera,%s), people=COALESCE(people,%s) "
+                "WHERE trip_id=%s AND immich_asset_id=%s AND (camera IS NULL OR people IS NULL)",
+                (cam, ppl, trip_id, aid))
             continue
         cap = matcher.capture_epoch(a)
         ex = a.get("exifInfo") or {}
@@ -307,10 +369,11 @@ def sync_photos(trip_id):
             lat, lon = loc
             matched_by = "track"
         cap_dt = dt.datetime.fromtimestamp(cap, dt.timezone.utc) if cap else None
+        mtype = "video" if a.get("type") == "VIDEO" else "image"
         dbx(
-            "INSERT INTO trips.photo(trip_id, immich_asset_id, capture_ts, lat, lon, matched_by, original_filename) "
-            "VALUES (%s,%s,%s,%s,%s,%s,%s) ON CONFLICT (trip_id, immich_asset_id) DO NOTHING",
-            (trip_id, aid, cap_dt, lat, lon, matched_by, a.get("originalFileName")),
+            "INSERT INTO trips.photo(trip_id, immich_asset_id, capture_ts, lat, lon, matched_by, original_filename, media_type, camera, people) "
+            "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) ON CONFLICT (trip_id, immich_asset_id) DO NOTHING",
+            (trip_id, aid, cap_dt, lat, lon, matched_by, a.get("originalFileName"), mtype, cam, ppl),
         )
         existing.add(aid)
         added += 1
@@ -351,29 +414,44 @@ def publish_state():
             "trip_id": int(t["id"]),
             "name": t["name"],
             "interval_s": int(t["interval_s"]),
+            "mode": norm_mode(t.get("mode")),
+            "min_distance_m": int(t["min_distance_m"]) if t.get("min_distance_m") is not None else None,
             "started_at": iso(t["started_at"]),
         }
     else:
-        payload = {"active": False, "trip_id": None, "name": None, "interval_s": None, "started_at": None}
+        payload = {"active": False, "trip_id": None, "name": None, "interval_s": None,
+                   "mode": None, "min_distance_m": None, "started_at": None}
     mqtt_publish(f"{BASE}/state", payload, retain=True)
 
 
 def handle_track(msg):
-    t = get_active_trip()
-    if not t:
-        log.debug("track dropped — no active trip")
-        return
     if "lat" not in msg or "lon" not in msg:
+        return
+    # Prefer the trip_id carried in the payload: the phone buffers fixes during an MQTT/network outage
+    # and replays them on reconnect, possibly AFTER the trip was stopped — those must still land in
+    # their own trip. Fall back to the current active trip when the payload omits it.
+    tid = None
+    mtid = msg.get("trip_id")
+    if mtid:
+        row = dbx("SELECT id FROM trips.trip WHERE id=%s", (int(mtid),), fetch="one")
+        if row:
+            tid = int(row[0])
+    if tid is None:
+        t = get_active_trip()
+        tid = int(t["id"]) if t else None
+    if tid is None:
+        log.debug("track dropped — no trip")
         return
     ts = parse_ts(msg.get("ts"))
     lat, lon = float(msg["lat"]), float(msg["lon"])
 
-    # GPS-outlier guard: reject a point that would imply an impossible speed from the last accepted
-    # point (a GPS glitch), so it never enters the track / photo-matching / renderers.
+    # GPS-outlier guard: reject a point implying an impossible speed. Compare against the TIME-predecessor
+    # (the stored point with the greatest ts <= this one), not the last-inserted row — replayed buffered
+    # points arrive with a newer id but an OLDER ts, so "last by id" would be the wrong neighbour.
     last = dbx(
         "SELECT EXTRACT(EPOCH FROM ts) AS e, lat, lon FROM trips.track_point "
-        "WHERE trip_id=%s ORDER BY id DESC LIMIT 1",
-        (int(t["id"]),), fetch="one", dict_cur=True,
+        "WHERE trip_id=%s AND ts <= %s ORDER BY ts DESC, id DESC LIMIT 1",
+        (tid, ts), fetch="one", dict_cur=True,
     )
     if last:
         dist = matcher.haversine(float(last["lat"]), float(last["lon"]), lat, lon)
@@ -381,26 +459,17 @@ def handle_track(msg):
         if dt_s > 0:
             if dist / dt_s > MAX_SPEED_MS:
                 log.info("track point REJECTED trip=%s: %.0f km/h (>%.0f) over %.0fm/%.1fs",
-                         t["id"], (dist / dt_s) * 3.6, MAX_SPEED_MS * 3.6, dist, dt_s)
+                         tid, (dist / dt_s) * 3.6, MAX_SPEED_MS * 3.6, dist, dt_s)
                 return
         elif dist > 1000:
-            # no forward time but a >1 km jump — almost certainly a glitch
-            log.info("track point REJECTED trip=%s: %.0fm jump with no time advance", t["id"], dist)
+            # same timestamp but a >1 km jump — almost certainly a glitch
+            log.info("track point REJECTED trip=%s: %.0fm jump with no time advance", tid, dist)
             return
 
     dbx(
         "INSERT INTO trips.track_point(trip_id, ts, lat, lon, accuracy, speed, altitude, source) "
         "VALUES (%s,%s,%s,%s,%s,%s,%s,%s)",
-        (
-            int(t["id"]),
-            ts,
-            float(msg["lat"]),
-            float(msg["lon"]),
-            msg.get("acc"),
-            msg.get("speed"),
-            msg.get("alt"),
-            msg.get("source", "app"),
-        ),
+        (tid, ts, lat, lon, msg.get("acc"), msg.get("speed"), msg.get("alt"), msg.get("source", "app")),
     )
 
 
@@ -409,7 +478,8 @@ def handle_control(msg):
         return  # our own echo to the phone
     cmd = msg.get("cmd")
     if cmd == "start":
-        start_trip(msg.get("name"), int(msg.get("interval_s") or 15), origin="app")
+        start_trip(msg.get("name"), int(msg.get("interval_s") or 5), origin="app",
+                   mode=msg.get("mode"), min_distance_m=msg.get("min_distance_m"))
     elif cmd == "stop":
         stop_trip(origin="app")
 
@@ -566,9 +636,33 @@ def admin_basemap():
 app = Flask(__name__, static_folder=os.path.join(HERE, "static"), static_url_path="/static")
 
 
+def _asset_version():
+    """A token that changes whenever a static file changes (newest mtime), so `?v=` busts stale caches."""
+    try:
+        files = ("index.html", "app.js", "app.css")
+        return str(int(max(os.path.getmtime(os.path.join(app.static_folder, f)) for f in files)))
+    except Exception:
+        return str(int(time.time()))
+
+
 @app.route("/")
 def index():
-    return send_from_directory(app.static_folder, "index.html")
+    with open(os.path.join(app.static_folder, "index.html"), encoding="utf-8") as fh:
+        html = fh.read()
+    return Response(html.replace("__V__", _asset_version()), mimetype="text/html")
+
+
+@app.after_request
+def _no_store_shell(resp):
+    # The app shell (HTML + JS + CSS) must never be cached by the HA ingress WebView — it ignores
+    # `no-cache` revalidation and serves stale code. `no-store` + versioned `?v=` URLs force fresh loads.
+    # (immich photo proxies under /api/photo/... keep their own cacheable headers — they're immutable by id.)
+    p = request.path or ""
+    if p == "/" or p.startswith("/static/app."):   # index.html, app.js, app.css (vendor libs keep no-cache)
+        resp.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+        resp.headers["Pragma"] = "no-cache"
+        resp.headers["Expires"] = "0"
+    return resp
 
 
 @app.route("/api/state")
@@ -595,7 +689,7 @@ def api_state():
 @app.route("/api/trips")
 def api_trips():
     rows = dbx(
-        """SELECT t.id, t.name, t.started_at, t.stopped_at, t.active, t.interval_s,
+        """SELECT t.id, t.name, t.started_at, t.stopped_at, t.active, t.interval_s, t.mode, t.min_distance_m, t.color,
                   (SELECT count(*) FROM trips.track_point p WHERE p.trip_id=t.id) AS points,
                   (SELECT count(*) FROM trips.photo ph WHERE ph.trip_id=t.id)      AS photos
              FROM trips.trip t ORDER BY t.started_at DESC""",
@@ -609,7 +703,8 @@ def api_trips():
 def api_start():
     require_admin()
     b = request.get_json(force=True, silent=True) or {}
-    start_trip(b.get("name"), int(b.get("interval_s") or 15), origin="web")
+    start_trip(b.get("name"), int(b.get("interval_s") or 5), origin="web",
+               mode=b.get("mode"), min_distance_m=b.get("min_distance_m"), color=b.get("color"))
     return jsonify(trip_public(get_active_trip()))
 
 
@@ -618,6 +713,36 @@ def api_stop():
     require_admin()
     stop_trip(origin="web")
     return jsonify({"ok": True})
+
+
+@app.route("/api/trips/<int:tid>/spacing", methods=["POST"])
+def api_spacing(tid):
+    # Change a trip's spacing LIVE. For the active trip this republishes the retained trips/state, which
+    # the phone's onState picks up and re-requests GPS with the new mode/interval/distance — same trip.
+    require_admin()
+    b = request.get_json(force=True, silent=True) or {}
+    mode = norm_mode(b.get("mode"))
+    try:
+        interval_s = int(b.get("interval_s") or 5)
+    except (TypeError, ValueError):
+        interval_s = 5
+    if mode in ("distance", "hybrid"):
+        try:
+            md = int(b.get("min_distance_m"))
+        except (TypeError, ValueError):
+            md = 25
+        if md < 1:
+            md = 25
+    else:
+        md = None
+    dbx("UPDATE trips.trip SET mode=%s, interval_s=%s, min_distance_m=%s WHERE id=%s",
+        (mode, interval_s, md, tid))
+    t = get_active_trip()
+    live = bool(t and int(t["id"]) == tid)
+    if live:
+        publish_state()   # retained → phone re-requests GPS with the new spacing, no restart
+    log.info("spacing update trip=%s mode=%s interval=%ss dist=%sm live=%s", tid, mode, interval_s, md, live)
+    return jsonify({"ok": True, "live": live, "trip": trip_public(get_active_trip()) if live else None})
 
 
 @app.route("/api/basemap", methods=["POST"])
@@ -636,9 +761,17 @@ def api_basemap():
 
 @app.route("/api/trips/<int:tid>/rename", methods=["POST"])
 def api_rename(tid):
+    # Edit a trip's name and/or track colour (only the provided fields are changed).
     require_admin()
     b = request.get_json(force=True, silent=True) or {}
-    dbx("UPDATE trips.trip SET name=%s WHERE id=%s", (b.get("name"), tid))
+    sets, params = [], []
+    if "name" in b:
+        sets.append("name=%s"); params.append(b.get("name"))
+    if b.get("color"):
+        sets.append("color=%s"); params.append(str(b.get("color")).strip())
+    if sets:
+        params.append(tid)
+        dbx(f"UPDATE trips.trip SET {', '.join(sets)} WHERE id=%s", tuple(params))
     t = get_active_trip()
     if t and int(t["id"]) == tid:
         publish_state()
@@ -657,7 +790,7 @@ def api_track(tid):
     since = int(request.args.get("since_id") or 0)
     rows = dbx(
         "SELECT id, EXTRACT(EPOCH FROM ts) AS ts, lat, lon, accuracy, speed, altitude "
-        "FROM trips.track_point WHERE trip_id=%s AND id>%s ORDER BY id",
+        "FROM trips.track_point WHERE trip_id=%s AND id>%s ORDER BY ts, id",
         (tid, since),
         fetch="all",
         dict_cur=True,
@@ -682,12 +815,17 @@ def api_track(tid):
 def api_photos(tid):
     since = int(request.args.get("since_id") or 0)
     rows = dbx(
-        "SELECT id, immich_asset_id, EXTRACT(EPOCH FROM capture_ts) AS cts, lat, lon, matched_by, original_filename "
+        "SELECT id, immich_asset_id, EXTRACT(EPOCH FROM capture_ts) AS cts, lat, lon, matched_by, original_filename, media_type, camera, people "
         "FROM trips.photo WHERE trip_id=%s AND id>%s AND lat IS NOT NULL ORDER BY id",
         (tid, since),
         fetch="all",
         dict_cur=True,
     )
+    def _people(v):
+        try:
+            return json.loads(v) if v else []
+        except Exception:
+            return []
     return jsonify(
         [
             {
@@ -698,6 +836,9 @@ def api_photos(tid):
                 "lon": r["lon"],
                 "matched_by": r["matched_by"],
                 "name": r["original_filename"],
+                "type": r.get("media_type") or "image",
+                "camera": r.get("camera"),
+                "people": _people(r.get("people")),
             }
             for r in rows
         ]
@@ -723,7 +864,35 @@ def _immich_proxy(path, params):
     if r.status_code != 200:
         abort(r.status_code)
     ct = r.headers.get("Content-Type", "application/octet-stream")
-    return Response(r.iter_content(8192), content_type=ct)
+    # immich assets are immutable by id → let the browser cache them hard so photo nav is instant on revisit.
+    return Response(r.iter_content(8192), content_type=ct,
+                    headers={"Cache-Control": "private, max-age=604800, immutable"})
+
+
+def _immich_proxy_range(path):
+    """Proxy a (large/seekable) immich stream, forwarding the browser's Range header and passing back
+    206/Content-Range so a <video> element can seek. Used for video playback."""
+    if not IMMICH_KEY:
+        abort(503)
+    headers = {"x-api-key": IMMICH_KEY}
+    rng = request.headers.get("Range")
+    if rng:
+        headers["Range"] = rng
+    r = requests.get(f"{IMMICH_URL}{path}", headers=headers, stream=True, timeout=60)
+    if r.status_code not in (200, 206):
+        abort(r.status_code)
+    out = {}
+    for h in ("Content-Type", "Content-Length", "Content-Range", "Accept-Ranges"):
+        if h in r.headers:
+            out[h] = r.headers[h]
+    out.setdefault("Accept-Ranges", "bytes")
+    return Response(r.iter_content(64 * 1024), status=r.status_code, headers=out)
+
+
+@app.route("/api/photo/<asset>/video")
+def api_video(asset):
+    # immich-transcoded playback stream (range-aware → seekable in <video>)
+    return _immich_proxy_range(f"/api/assets/{asset}/video/playback")
 
 
 @app.route("/api/photo/<asset>/thumbnail")

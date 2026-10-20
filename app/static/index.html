@@ -6,61 +6,136 @@
   <title>Trip Tracker</title>
   <link rel="stylesheet" href="static/vendor/leaflet.css">
   <link rel="stylesheet" href="static/vendor/maplibre-gl.css">
-  <link rel="stylesheet" href="static/app.css">
+  <link rel="stylesheet" href="static/app.css?v=__V__">
 </head>
 <body>
   <div id="app">
     <aside id="panel">
       <div class="panel-head">
-        <h1>🗺️ Trip Tracker <a id="popout" href="#" target="_blank" rel="noopener" title="Open in a new window">⇱</a></h1>
+        <h1>🗺️ Trip Tracker <a id="popout" href="#" target="_blank" rel="noopener" title="Open in a new window">⇱</a> <a id="reload" href="#" title="Reload latest from server (bypass cache)">↻</a></h1>
         <button id="panel-toggle" title="Hide panel">◂</button>
       </div>
 
-      <div id="active-box" class="box"></div>
+      <nav id="panel-tabs">
+        <button class="ptab active" data-tab="main">Trips</button>
+        <button class="ptab" id="tab-start-btn" data-tab="start">Start a trip</button>
+        <button class="ptab" data-tab="filter">Filter</button>
+      </nav>
 
-      <div class="box">
-        <label class="row basemap-row">🗺️ Basemap
-          <select id="basemap"></select>
-        </label>
+      <div class="ptab-page" data-page="main">
+        <div class="box">
+          <label class="row basemap-row">🗺️ Basemap
+            <select id="basemap"></select>
+          </label>
+          <label class="row basemap-row" style="margin-top:10px;">
+            <span style="flex:1;">🎨 Colour track by speed</span>
+            <input type="checkbox" id="speed-color">
+          </label>
+        </div>
+
+        <div class="box grow">
+          <h2>Trips</h2>
+          <ul id="trip-list"></ul>
+        </div>
       </div>
 
-      <div id="start-box" class="box">
-        <h2>Start a trip</h2>
-        <input id="trip-name" type="text" placeholder="Trip name (optional)">
-        <label class="row">Send interval <span id="iv-label">15</span> s
-          <input id="trip-interval" type="range" min="2" max="120" value="15">
-        </label>
-        <button id="btn-start" class="primary">▶ Start Trip</button>
-        <button id="btn-stop" class="danger" hidden>■ Stop Trip</button>
+      <div class="ptab-page" data-page="filter" hidden>
+        <div class="box">
+          <h2>People</h2>
+          <div id="filter-people" class="filter-list"></div>
+        </div>
+        <div class="box">
+          <h2>Camera</h2>
+          <div id="filter-camera" class="filter-list"></div>
+        </div>
+        <button id="filter-clear">Clear filters</button>
       </div>
 
-      <div class="box grow">
-        <h2>Trips</h2>
-        <ul id="trip-list"></ul>
+      <div class="ptab-page" data-page="start" hidden>
+        <div id="start-box" class="box">
+          <h2>Start a trip</h2>
+          <input id="trip-name" type="text" placeholder="Trip name (optional)">
+          <label class="row basemap-row">🎨 Track colour
+            <input id="trip-color" type="color" value="#1565c0">
+          </label>
+          <label class="row basemap-row">Spacing
+            <select id="trip-mode">
+              <option value="hybrid">Hybrid (time + distance)</option>
+              <option value="time">By time</option>
+              <option value="distance">By distance</option>
+            </select>
+          </label>
+          <label class="row" id="iv-row">Send interval <span id="iv-label">5</span> s
+            <input id="trip-interval" type="range" min="1" max="60" value="5">
+          </label>
+          <label class="row" id="dist-row">Send every <span id="dist-label">25</span> m
+            <input id="trip-distance" type="range" min="1" max="100" step="1" value="25">
+          </label>
+          <div class="start-actions">
+            <button id="btn-start" class="primary">▶ Start Trip</button>
+            <button id="btn-apply" class="primary" hidden>✓ Apply spacing to live trip</button>
+            <button id="btn-stop" class="danger" hidden>■ Stop Trip</button>
+          </div>
+        </div>
       </div>
-
-      <div class="box small" id="cfg-box"></div>
     </aside>
 
     <main id="mapwrap">
       <div id="map"></div>
       <div id="gmap"></div>
       <button id="panel-show" title="Show panel">▸</button>
-      <div id="balloon" class="hidden"></div>
+      <div id="speed-overlay" class="hidden"></div>
     </main>
+
+    <section id="photodock" aria-hidden="true">
+      <div id="pv-stage">
+        <img id="pv-img" alt="">
+        <img id="pv-ghost" alt="">
+        <div id="pv-play" hidden>▶</div>
+        <button class="pv-nav pv-prev" id="pv-prev" title="Previous (←)">‹</button>
+        <button class="pv-nav pv-next" id="pv-next" title="Next (→)">›</button>
+        <button id="pv-full" title="Full screen">⛶</button>
+        <button id="pv-close" title="Close">✕</button>
+        <div id="pv-meta"></div>
+      </div>
+    </section>
   </div>
+
+  <!-- trip edit dialog (admin): rename + pick the track colour -->
+  <div id="edit-modal" class="modal-hidden">
+    <div class="modal-card">
+      <h2>Edit trip</h2>
+      <label class="row">Name
+        <input id="edit-name" type="text">
+      </label>
+      <label class="row basemap-row">🎨 Track colour
+        <input id="edit-color" type="color">
+      </label>
+      <div class="modal-actions">
+        <button id="edit-cancel">Cancel</button>
+        <button id="edit-save" class="primary">Save</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- transient shield: swallows the stray tap/click left over when the fullscreen overlay closes under
+       the finger, so the map below doesn't pan/zoom from it -->
+  <div id="tap-shield"></div>
 
   <div id="lightbox" class="lb-hidden" aria-hidden="true">
     <button id="lb-prev" class="lb-nav" title="Previous (←)">‹</button>
     <img id="lb-img" alt="">
+    <img id="lb-ghost" alt="">
+    <video id="lb-video" controls playsinline preload="metadata" style="display:none"></video>
     <button id="lb-next" class="lb-nav" title="Next (→)">›</button>
     <button id="lb-close" title="Close (Esc)">✕</button>
     <a id="lb-orig" href="#" target="_blank" rel="noopener">Open original ↗</a>
+    <div id="lb-meta"></div>
   </div>
 
   <script src="static/vendor/leaflet.js"></script>
   <script src="static/vendor/maplibre-gl.js"></script>
   <script src="static/vendor/leaflet-maplibre-gl.js"></script>
-  <script src="static/app.js"></script>
+  <script src="static/app.js?v=__V__"></script>
 </body>
 </html>
