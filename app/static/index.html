@@ -48,7 +48,10 @@
           <h2>Camera</h2>
           <div id="filter-camera" class="filter-list"></div>
         </div>
-        <button id="filter-clear">Clear filters</button>
+        <div class="filter-foot">
+          <span id="filter-count">0 images</span>
+          <button id="filter-clear">Clear</button>
+        </div>
       </div>
 
       <div class="ptab-page" data-page="start" hidden>
@@ -83,8 +86,69 @@
     <main id="mapwrap">
       <div id="map"></div>
       <div id="gmap"></div>
+      <canvas id="edit-selcanvas"></canvas>
+      <div id="edit-rubber"></div>
       <button id="panel-show" title="Show panel">▸</button>
+      <button id="map-grid" title="Close map — show photo grid">✕</button>
+      <button id="map-stats" title="Trip stats">📊</button>
+      <button id="map-replay" title="Replay trip">⏵</button>
+      <button id="map-edit" title="Edit track">✏️</button>
       <div id="speed-overlay" class="hidden"></div>
+      <div id="replay-bar" hidden>
+        <button id="rp-play" title="Play / pause">⏵</button>
+        <input id="rp-slider" type="range" min="0" max="1000" value="0">
+        <span id="rp-time" class="rp-time"></span>
+        <button id="rp-close" class="ov-x" title="Close replay">✕</button>
+      </div>
+      <div id="stats-overlay" hidden>
+        <div class="ov-head">
+          <div id="stats-title" class="ov-title"></div>
+          <button id="stats-close" class="ov-x" title="Close">✕</button>
+        </div>
+        <div id="stats-body" class="ov-body"></div>
+      </div>
+
+      <!-- track-edit toolbar (admin): appears over the map in edit mode -->
+      <div id="edit-tb" hidden>
+        <span id="edit-hint" class="edit-hint">Click the track to select points</span>
+        <div class="edit-btns">
+          <button id="et-box" title="Drag a box on the map to select points inside it">▭ Box</button>
+          <button id="et-all" title="Select all points in the track">✦ All</button>
+          <button id="et-add">＋ Add</button>
+          <button id="et-del">🗑 Delete</button>
+          <button id="et-clear" title="Clear the current selection">⊘ Clear</button>
+          <button id="et-join" title="Join two endpoints with a straight line (no points added)">🔗 Join</button>
+          <button id="et-fill" title="Fill big gaps within the selection with intermediate points">🧩 Fill</button>
+          <button id="et-ts">ts: keep</button>
+          <button id="et-undo" title="Undo">↶</button>
+          <button id="et-redo" title="Redo">↷</button>
+          <span class="edit-arrows">
+            <button id="et-left" title="Nudge west">◀</button><button id="et-up" title="Nudge north">▲</button><button id="et-down" title="Nudge south">▼</button><button id="et-right" title="Nudge east">▶</button>
+          </span>
+          <label class="et-snap-l" title="Click-to-select snap radius (pixels)">snap <input id="et-snap" type="number" min="5" max="100" step="1" value="25"> px</label>
+          <button id="et-close">✕ Close</button>
+        </div>
+      </div>
+      <div id="photogrid" hidden>
+        <!-- current-photo position bar: 2px red, at the very top, above the top-bar -->
+        <div id="pg-progress"><div id="pg-progress-fill"></div></div>
+        <div class="pg-head">
+          <div id="pg-trip" class="pg-trip"></div>
+          <div class="pg-head-row">
+            <span id="pg-count" class="pg-count"></span>
+            <span id="pg-tagcounts" class="pg-tagcounts" hidden></span>
+            <span class="pg-spacer"></span>
+            <button id="pg-tagall-rel" class="pg-tagall" hidden title="Tag all shown photos as Relatives">👪 Tag all</button>
+            <button id="pg-tagall-world" class="pg-tagall" hidden title="Tag all shown photos as World">🌍 Tag all</button>
+            <label class="pg-cols">Columns <span id="pg-cols-v">4</span>
+              <input id="pg-cols" type="range" min="2" max="20" value="4">
+            </label>
+            <label id="pg-tagmode-row" class="pg-tagmode" hidden><input type="checkbox" id="pg-tagmode"> Tag</label>
+            <button id="pg-close" title="Close grid — show map">✕</button>
+          </div>
+        </div>
+        <div id="pg-items" class="pg-items"></div>
+      </div>
     </main>
 
     <section id="photodock" aria-hidden="true">
@@ -96,6 +160,11 @@
         <button class="pv-nav pv-next" id="pv-next" title="Next (→)">›</button>
         <button id="pv-full" title="Full screen">⛶</button>
         <button id="pv-close" title="Close">✕</button>
+        <div id="pv-tags" class="pv-tags" hidden>
+          <button id="pv-tag-rel" data-tag="Relatives" class="pv-tag" title="Tag/untag as Relatives">👪 Relatives</button>
+          <button id="pv-tag-world" data-tag="World" class="pv-tag" title="Tag/untag as World">🌍 World</button>
+          <button id="pv-del" class="pv-tag pv-del" title="Delete photo (move to immich trash)">🗑 Delete</button>
+        </div>
         <div id="pv-meta"></div>
       </div>
     </section>
@@ -111,6 +180,45 @@
       <label class="row basemap-row">🎨 Track colour
         <input id="edit-color" type="color">
       </label>
+      <label class="row basemap-row">🙈 Hide from viewers
+        <input id="edit-hidden" type="checkbox">
+      </label>
+
+      <div class="modal-sec">
+        <h3>Gaps</h3>
+        <div class="modal-btns">
+          <button id="edit-fill">🧩 Fill gaps</button>
+          <button id="edit-unfill">✖ Remove filled</button>
+          <span id="edit-fill-status" class="hint"></span>
+        </div>
+      </div>
+
+      <div class="modal-sec">
+        <h3>Export</h3>
+        <div class="modal-btns">
+          <a id="edit-gpx" class="btn-dl" download>⬇ GPX</a>
+          <a id="edit-geojson" class="btn-dl" download>⬇ GeoJSON</a>
+        </div>
+      </div>
+
+      <div class="modal-sec">
+        <h3>Share links <span class="hint">scoped, read-only</span></h3>
+        <div class="share-row" data-scope="relatives">
+          <span class="share-lbl">👪 Relatives</span>
+          <input class="share-url" type="text" readonly placeholder="(no link)">
+          <button class="share-make">Create</button>
+          <button class="share-copy" hidden>Copy</button>
+          <button class="share-del" hidden>Remove</button>
+        </div>
+        <div class="share-row" data-scope="world">
+          <span class="share-lbl">🌍 World</span>
+          <input class="share-url" type="text" readonly placeholder="(no link)">
+          <button class="share-make">Create</button>
+          <button class="share-copy" hidden>Copy</button>
+          <button class="share-del" hidden>Remove</button>
+        </div>
+      </div>
+
       <div class="modal-actions">
         <button id="edit-cancel">Cancel</button>
         <button id="edit-save" class="primary">Save</button>

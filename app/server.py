@@ -8,9 +8,13 @@ Flask (served by waitress) behind HA ingress, plus two background threads:
 State of record is the recorder Postgres `trips` schema.
 """
 import datetime as dt
+import gzip
+import html
 import json
 import logging
 import os
+import re
+import secrets
 import threading
 import time
 
@@ -19,6 +23,8 @@ import psycopg2.extras
 import requests
 from flask import Flask, Response, abort, jsonify, request, send_from_directory
 from psycopg2 import pool as pgpool
+
+import gapfill  # rail/road gap-filling engine (same dir)
 import paho.mqtt.client as mqtt
 
 import matcher
@@ -33,6 +39,10 @@ _ha_tok = (os.environ.get("TT_HA_TOKEN") or "").strip()
 HA_TOKEN = "" if _ha_tok.lower() == "null" else _ha_tok
 _gkey = (os.environ.get("TT_GOOGLE_MAPS_KEY") or "").strip()
 GOOGLE_KEY = "" if _gkey.lower() == "null" else _gkey
+# Shared secret for the native Android app: a request carrying header `X-TT-Token` matching this value is
+# treated as a logged-in ADMIN (the app hits the direct host port :8099, which has no HA ingress session).
+_app_tok = (os.environ.get("TT_APP_TOKEN") or "").strip()
+APP_TOKEN = "" if _app_tok.lower() == "null" else _app_tok
 MQTT_HOST = os.environ.get("TT_MQTT_HOST") or "172.20.1.100"
 MQTT_PORT = int(os.environ.get("TT_MQTT_PORT") or 1883)
 MQTT_USER = os.environ.get("TT_MQTT_USER") or None
@@ -45,7 +55,17 @@ try:
     _mx = float(os.environ.get("TT_MAX_SPEED_KMPH") or 150)
 except (TypeError, ValueError):
     _mx = 150.0
-MAX_SPEED_MS = (_mx if _mx > 0 else 150.0) / 3.6   # reject track points implying a faster-than-real speed
+MAX_SPEED_MS = (_mx if _mx > 0 else 150.0) / 3.6   # (legacy) absolute speed sanity ceiling
+# Adaptive GPS-outlier guard: a point is an outlier if it lands farther from the last accepted point than
+# max(OUTLIER_BASE_M, recent_speed * dt * OUTLIER_K). Scales with recent speed (train/plane friendly),
+# while BASE catches teleports from near-stationary. Only applied for dt <= OUTLIER_GAP_S (a larger dt is a
+# real data gap — the predecessor is stale, so we don't outlier-gate it).
+OUTLIER_BASE_M   = float(os.environ.get("TT_OUTLIER_BASE_M") or 50)
+OUTLIER_K        = float(os.environ.get("TT_OUTLIER_K") or 2.0)
+OUTLIER_GAP_S    = float(os.environ.get("TT_OUTLIER_GAP_S") or 20)
+RECENT_WINDOW_S  = float(os.environ.get("TT_RECENT_WINDOW_S") or 20)
+ALT_MAX_VERT     = float(os.environ.get("TT_ALT_MAX_VERT_MS") or 2.0)   # m/s: steeper vertical rate = bad altitude reading
+SHARE_BASE       = os.environ.get("TT_SHARE_BASE") or "https://trips.ajithv.in"   # public base for share links
 MAP_LAT = float(os.environ.get("TT_MAP_CENTER_LAT") or 12.9716)
 MAP_LON = float(os.environ.get("TT_MAP_CENTER_LON") or 77.5946)
 MAP_ZOOM = int(os.environ.get("TT_MAP_ZOOM") or 13)
@@ -169,14 +189,54 @@ CREATE INDEX IF NOT EXISTS photo_trip_idx ON trips.photo(trip_id, id);
 ALTER TABLE trips.trip ADD COLUMN IF NOT EXISTS mode text NOT NULL DEFAULT 'time';
 ALTER TABLE trips.trip ADD COLUMN IF NOT EXISTS min_distance_m integer;
 ALTER TABLE trips.trip ADD COLUMN IF NOT EXISTS color text;
+ALTER TABLE trips.trip ADD COLUMN IF NOT EXISTS hidden boolean NOT NULL DEFAULT false;
+ALTER TABLE trips.trip ADD COLUMN IF NOT EXISTS distance_m double precision NOT NULL DEFAULT 0;
+ALTER TABLE trips.trip ADD COLUMN IF NOT EXISTS share_token text;
+CREATE INDEX IF NOT EXISTS trip_share_idx ON trips.trip(share_token);
 ALTER TABLE trips.photo ADD COLUMN IF NOT EXISTS media_type text NOT NULL DEFAULT 'image';
 ALTER TABLE trips.photo ADD COLUMN IF NOT EXISTS camera text;
 ALTER TABLE trips.photo ADD COLUMN IF NOT EXISTS people text;
+-- admin-applied visibility tags per immich asset ('Relatives' / 'World'); drive the scoped share links
+CREATE TABLE IF NOT EXISTS trips.photo_tag (
+  immich_asset_id text NOT NULL,
+  tag             text NOT NULL,
+  PRIMARY KEY (immich_asset_id, tag)
+);
+-- scoped public share tokens: one per (trip, scope) where scope in ('relatives','world')
+CREATE TABLE IF NOT EXISTS trips.share (
+  token      text PRIMARY KEY,
+  trip_id    integer NOT NULL REFERENCES trips.trip(id) ON DELETE CASCADE,
+  scope      text NOT NULL,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  UNIQUE (trip_id, scope)
+);
+"""
+
+
+# One authoritative recompute of every trip's total track distance (great-circle sum of consecutive hops,
+# ordered by ts,id). Run at boot so trips.distance_m is exact and self-heals any drift from the per-insert
+# incremental update in handle_track. Only runs at startup — never per request.
+BACKFILL_DIST_SQL = """
+UPDATE trips.trip SET distance_m = 0;
+UPDATE trips.trip t SET distance_m = s.dist FROM (
+  SELECT trip_id, COALESCE(SUM(seg), 0) AS dist FROM (
+    SELECT trip_id, 2*6371000*asin(LEAST(1.0, sqrt(
+             power(sin(radians(lat - plat) / 2), 2)
+             + cos(radians(plat)) * cos(radians(lat)) * power(sin(radians(lon - plon) / 2), 2)))) AS seg
+      FROM (
+        SELECT trip_id, lat, lon,
+               lag(lat) OVER (PARTITION BY trip_id ORDER BY ts, id) AS plat,
+               lag(lon) OVER (PARTITION BY trip_id ORDER BY ts, id) AS plon
+          FROM trips.track_point
+      ) q WHERE plat IS NOT NULL
+  ) seg_q GROUP BY trip_id
+) s WHERE s.trip_id = t.id;
 """
 
 
 def bootstrap_schema():
     dbx(SCHEMA_SQL)
+    dbx(BACKFILL_DIST_SQL)
     log.info("trips schema ready")
 
 
@@ -445,32 +505,61 @@ def handle_track(msg):
     ts = parse_ts(msg.get("ts"))
     lat, lon = float(msg["lat"]), float(msg["lon"])
 
-    # GPS-outlier guard: reject a point implying an impossible speed. Compare against the TIME-predecessor
-    # (the stored point with the greatest ts <= this one), not the last-inserted row — replayed buffered
-    # points arrive with a newer id but an OLDER ts, so "last by id" would be the wrong neighbour.
-    last = dbx(
-        "SELECT EXTRACT(EPOCH FROM ts) AS e, lat, lon FROM trips.track_point "
-        "WHERE trip_id=%s AND ts <= %s ORDER BY ts DESC, id DESC LIMIT 1",
-        (tid, ts), fetch="one", dict_cur=True,
+    # Adaptive GPS-outlier guard. Compare against the TIME-predecessor and a short recent window (greatest
+    # ts <= this one), NOT the last-inserted row — replayed buffered points arrive with a newer id but an
+    # OLDER ts, so "last by id" would be the wrong neighbour.
+    hop_m = 0.0   # great-circle distance from the predecessor → added to trips.distance_m after insert
+    recent = dbx(
+        "SELECT EXTRACT(EPOCH FROM ts) AS e, lat, lon, altitude FROM trips.track_point "
+        "WHERE trip_id=%s AND ts <= %s ORDER BY ts DESC, id DESC LIMIT 5",
+        (tid, ts), fetch="all", dict_cur=True,
     )
-    if last:
+    if recent:
+        last = recent[0]
         dist = matcher.haversine(float(last["lat"]), float(last["lon"]), lat, lon)
+        hop_m = dist
         dt_s = ts.timestamp() - float(last["e"])
-        if dt_s > 0:
-            if dist / dt_s > MAX_SPEED_MS:
-                log.info("track point REJECTED trip=%s: %.0f km/h (>%.0f) over %.0fm/%.1fs",
-                         tid, (dist / dt_s) * 3.6, MAX_SPEED_MS * 3.6, dist, dt_s)
+        if dt_s <= 0:
+            if dist > 1000:   # same timestamp but a >1 km jump — almost certainly a glitch
+                log.info("track point REJECTED trip=%s: %.0fm jump with no time advance", tid, dist)
                 return
-        elif dist > 1000:
-            # same timestamp but a >1 km jump — almost certainly a glitch
-            log.info("track point REJECTED trip=%s: %.0fm jump with no time advance", tid, dist)
-            return
+        elif dt_s <= OUTLIER_GAP_S:
+            # recent average speed over the window (oldest -> newest), within RECENT_WINDOW_S
+            win = [r for r in recent if float(last["e"]) - float(r["e"]) <= RECENT_WINDOW_S]
+            win.reverse()
+            recent_ms = 0.0
+            if len(win) >= 2:
+                td = sum(matcher.haversine(float(win[i - 1]["lat"]), float(win[i - 1]["lon"]),
+                                           float(win[i]["lat"]), float(win[i]["lon"]))
+                         for i in range(1, len(win)))
+                tt = float(win[-1]["e"]) - float(win[0]["e"])
+                if tt > 0:
+                    recent_ms = td / tt
+            allow = max(OUTLIER_BASE_M, recent_ms * dt_s * OUTLIER_K)
+            if dist > allow:
+                log.info("track point REJECTED trip=%s: %.0fm jump > %.0fm allowed (recent %.0f km/h, dt %.1fs) — GPS outlier",
+                         tid, dist, allow, recent_ms * 3.6, dt_s)
+                return
+        # dt_s > OUTLIER_GAP_S → a real data gap (signal loss); predecessor is stale, so don't outlier-gate.
 
+    # Altitude spike gate (like the position guard): drop an altitude whose vertical rate vs the last
+    # reading is impossible for ground travel — keeps the point, just not the bad altitude.
+    alt = msg.get("alt")
+    if alt is not None and recent:
+        try:
+            la = recent[0].get("altitude"); dt_a = ts.timestamp() - float(recent[0]["e"])
+            if la is not None and dt_a > 0 and abs(float(alt) - float(la)) / dt_a > ALT_MAX_VERT:
+                log.info("altitude spike dropped trip=%s: %.0fm/%.1fs", tid, abs(float(alt) - float(la)), dt_a)
+                alt = None
+        except (TypeError, ValueError):
+            pass
     dbx(
         "INSERT INTO trips.track_point(trip_id, ts, lat, lon, accuracy, speed, altitude, source) "
         "VALUES (%s,%s,%s,%s,%s,%s,%s,%s)",
-        (tid, ts, lat, lon, msg.get("acc"), msg.get("speed"), msg.get("alt"), msg.get("source", "app")),
+        (tid, ts, lat, lon, msg.get("acc"), msg.get("speed"), alt, msg.get("source", "app")),
     )
+    if hop_m > 0:   # keep the running total fresh without re-summing the whole track per /api/trips call
+        dbx("UPDATE trips.trip SET distance_m = distance_m + %s WHERE id=%s", (hop_m, tid))
 
 
 def handle_control(msg):
@@ -591,7 +680,14 @@ def request_is_admin():
     has no HA session at all, so it's treated as non-admin → view-only map, no controls (the requirement:
     the control panel shows only for a logged-in admin session). An authenticated HA user whose admin
     status can't be verified (admin list unavailable — no token / HA unreachable) is allowed, so a
-    transient WS hiccup never locks the owner out of their own ingress panel."""
+    transient WS hiccup never locks the owner out of their own ingress panel.
+
+    The native Android app has no HA session, so it authenticates with a shared `X-TT-Token` header
+    (set to the `app_token` add-on option) → full admin over the direct host port."""
+    if APP_TOKEN:
+        tok = request.headers.get("X-TT-Token")
+        if tok and tok == APP_TOKEN:
+            return True
     uid = request.headers.get("X-Remote-User-Id")
     if not uid:
         return False  # no logged-in HA (ingress) session → view-only
@@ -636,6 +732,33 @@ def admin_basemap():
 app = Flask(__name__, static_folder=os.path.join(HERE, "static"), static_url_path="/static")
 
 
+@app.after_request
+def _gzip(resp):
+    """gzip JSON/text replies (a big trip's first full-track fetch is ~1-2 MB). Skips streamed image/video
+    proxy responses (binary + already compressed, and streaming — never buffer them into memory)."""
+    try:
+        if "gzip" not in request.headers.get("Accept-Encoding", ""):
+            return resp
+        if resp.direct_passthrough or resp.status_code < 200 or resp.status_code >= 300:
+            return resp
+        ct = (resp.content_type or "")
+        if not (ct.startswith("application/json") or ct.startswith("text/")):
+            return resp
+        if "Content-Encoding" in resp.headers:
+            return resp
+        data = resp.get_data()
+        if len(data) < 500:
+            return resp
+        comp = gzip.compress(data, 6)
+        resp.set_data(comp)
+        resp.headers["Content-Encoding"] = "gzip"
+        resp.headers["Content-Length"] = str(len(comp))
+        resp.headers["Vary"] = "Accept-Encoding"
+    except Exception as e:
+        log.debug("gzip skipped: %s", e)
+    return resp
+
+
 def _asset_version():
     """A token that changes whenever a static file changes (newest mtime), so `?v=` busts stale caches."""
     try:
@@ -668,10 +791,14 @@ def _no_store_shell(resp):
 @app.route("/api/state")
 def api_state():
     t = get_active_trip()
+    admin = request_is_admin()
+    # A hidden live trip must not be revealed to non-admin viewers: no active state → no pill, no auto-follow.
+    if t and not admin and trip_is_hidden(int(t["id"])):
+        t = None
     return jsonify(
         {
             "active": bool(t),
-            "admin": request_is_admin(),
+            "admin": admin,
             "admin_basemap": admin_basemap(),
             "trip": trip_public(t) if t else None,
             "config": {
@@ -688,15 +815,26 @@ def api_state():
 
 @app.route("/api/trips")
 def api_trips():
+    # distance_m is maintained incrementally (handle_track) + recomputed exactly at boot (backfill), so the
+    # list no longer re-sums the whole track_point table on every call.
     rows = dbx(
-        """SELECT t.id, t.name, t.started_at, t.stopped_at, t.active, t.interval_s, t.mode, t.min_distance_m, t.color,
+        """SELECT t.id, t.name, t.started_at, t.stopped_at, t.active, t.interval_s, t.mode, t.min_distance_m, t.color, t.hidden, t.distance_m,
                   (SELECT count(*) FROM trips.track_point p WHERE p.trip_id=t.id) AS points,
                   (SELECT count(*) FROM trips.photo ph WHERE ph.trip_id=t.id)      AS photos
              FROM trips.trip t ORDER BY t.started_at DESC""",
         fetch="all",
         dict_cur=True,
     )
-    return jsonify([trip_public(r) for r in rows])
+    # Hidden trips are admin-only: non-admin viewers never see them in the list (nor their track/photos).
+    admin = request_is_admin()
+    out = []
+    for r in rows:
+        if not admin and r.get("hidden"):
+            continue
+        d = trip_public(r)
+        d["distance_m"] = round(float(r.get("distance_m") or 0.0), 1)
+        out.append(d)
+    return jsonify(out)
 
 
 @app.route("/api/trips/start", methods=["POST"])
@@ -769,6 +907,8 @@ def api_rename(tid):
         sets.append("name=%s"); params.append(b.get("name"))
     if b.get("color"):
         sets.append("color=%s"); params.append(str(b.get("color")).strip())
+    if "hidden" in b:
+        sets.append("hidden=%s"); params.append(bool(b.get("hidden")))
     if sets:
         params.append(tid)
         dbx(f"UPDATE trips.trip SET {', '.join(sets)} WHERE id=%s", tuple(params))
@@ -785,11 +925,19 @@ def api_delete(tid):
     return jsonify({"ok": True})
 
 
+def trip_is_hidden(tid):
+    """True if the trip is flagged hidden (admin-only). Gates track/photos for non-admin viewers."""
+    r = dbx("SELECT hidden FROM trips.trip WHERE id=%s", (tid,), fetch="one")
+    return bool(r and r[0])
+
+
 @app.route("/api/trips/<int:tid>/track")
 def api_track(tid):
+    if not request_is_admin() and trip_is_hidden(tid):
+        return jsonify([])
     since = int(request.args.get("since_id") or 0)
     rows = dbx(
-        "SELECT id, EXTRACT(EPOCH FROM ts) AS ts, lat, lon, accuracy, speed, altitude "
+        "SELECT id, EXTRACT(EPOCH FROM ts) AS ts, lat, lon, accuracy, speed, altitude, source "
         "FROM trips.track_point WHERE trip_id=%s AND id>%s ORDER BY ts, id",
         (tid, since),
         fetch="all",
@@ -805,18 +953,217 @@ def api_track(tid):
                 "acc": r["accuracy"],
                 "speed": r["speed"],
                 "alt": r["altitude"],
+                "source": r["source"],
             }
             for r in rows
         ]
     )
 
 
+def _insert_filled(tid, rows):
+    """Bulk-insert reconstructed fill points (source='filled'). rows: list of (ts_epoch, lat, lon, speed)."""
+    if not rows:
+        return 0
+    p = _get_pool(); conn = p.getconn()
+    try:
+        cur = conn.cursor()
+        psycopg2.extras.execute_values(
+            cur,
+            "INSERT INTO trips.track_point(trip_id, ts, lat, lon, speed, source) VALUES %s",
+            [(tid, ts, lat, lon, spd) for (ts, lat, lon, spd) in rows],
+            template="(%s, to_timestamp(%s), %s, %s, %s, 'filled')",
+        )
+        conn.commit(); cur.close()
+        return len(rows)
+    finally:
+        try: p.putconn(conn)
+        except Exception:
+            try: conn.close()
+            except Exception: pass
+
+
+_fill_jobs = {}            # tid -> {"state": running|done|error, ...}
+_fill_lock = threading.Lock()
+
+
+def _run_fill(tid):
+    try:
+        rows = dbx(
+            "SELECT EXTRACT(EPOCH FROM ts) AS ts, lat, lon FROM trips.track_point "
+            "WHERE trip_id=%s AND (source IS DISTINCT FROM 'filled') ORDER BY ts, id",
+            (tid,), fetch="all", dict_cur=True,
+        )
+        pts = [(float(r["ts"]), float(r["lat"]), float(r["lon"])) for r in rows]
+        if len(pts) < 2:
+            with _fill_lock: _fill_jobs[tid] = {"state": "error", "error": "no track"}
+            return
+        # clear any prior fill so the action is idempotent (reconstruct from the real fixes only)
+        dbx("DELETE FROM trips.track_point WHERE trip_id=%s AND source='filled'", (tid,))
+        filled, summary = gapfill.fill_trip_gaps(pts, log=lambda m: log.info(m))
+        added = _insert_filled(tid, filled)
+        dbx(BACKFILL_DIST_SQL)   # keep distance_m exact now that the geometry changed
+        result = {
+            "added": added, "gaps": len(summary),
+            "rail": sum(1 for s in summary if s["cls"] == "rail"),
+            "road": sum(1 for s in summary if s["cls"] == "road"),
+            "skipped": sum(1 for s in summary if s["cls"] == "skip"),
+            "detail": summary,
+        }
+        with _fill_lock: _fill_jobs[tid] = {"state": "done", "result": result}
+    except Exception as e:
+        log.exception("fill_gaps failed for trip %s", tid)
+        with _fill_lock: _fill_jobs[tid] = {"state": "error", "error": str(e)}
+
+
+@app.route("/api/trips/<int:tid>/fill_gaps", methods=["POST"])
+def api_fill_gaps(tid):
+    require_admin()
+    with _fill_lock:
+        if _fill_jobs.get(tid, {}).get("state") == "running":
+            return jsonify({"state": "running"})
+        _fill_jobs[tid] = {"state": "running"}
+    threading.Thread(target=_run_fill, args=(tid,), daemon=True).start()
+    return jsonify({"state": "running"})
+
+
+@app.route("/api/trips/<int:tid>/fill_status")
+def api_fill_status(tid):
+    require_admin()
+    with _fill_lock:
+        return jsonify(_fill_jobs.get(tid, {"state": "idle"}))
+
+
+@app.route("/api/trips/<int:tid>/unfill_gaps", methods=["POST"])
+def api_unfill_gaps(tid):
+    require_admin()
+    dbx("DELETE FROM trips.track_point WHERE trip_id=%s AND source='filled'", (tid,))
+    dbx(BACKFILL_DIST_SQL)
+    with _fill_lock:
+        _fill_jobs.pop(tid, None)
+    return jsonify({"ok": True})
+
+
+# ---------------------------------------------------------------- manual track editing (admin)
+@app.route("/api/trips/<int:tid>/points/move", methods=["POST"])
+def api_point_move(tid):
+    require_admin()
+    b = request.get_json(force=True, silent=True) or {}
+    pid, lat, lon, ts = b.get("id"), b.get("lat"), b.get("lon"), b.get("ts")
+    if pid is None or lat is None or lon is None:
+        abort(400)
+    if ts is not None:
+        dbx("UPDATE trips.track_point SET lat=%s, lon=%s, ts=to_timestamp(%s) WHERE trip_id=%s AND id=%s",
+            (lat, lon, float(ts), tid, int(pid)))
+    else:
+        dbx("UPDATE trips.track_point SET lat=%s, lon=%s WHERE trip_id=%s AND id=%s", (lat, lon, tid, int(pid)))
+    dbx(BACKFILL_DIST_SQL)
+    return jsonify({"ok": True})
+
+
+@app.route("/api/trips/<int:tid>/points/delete", methods=["POST"])
+def api_point_delete(tid):
+    require_admin()
+    b = request.get_json(force=True, silent=True) or {}
+    ids = [int(i) for i in (b.get("ids") or [])]
+    if not ids:
+        abort(400)
+    dbx("DELETE FROM trips.track_point WHERE trip_id=%s AND id = ANY(%s)", (tid, ids))
+    dbx(BACKFILL_DIST_SQL)
+    return jsonify({"ok": True, "deleted": len(ids)})
+
+
+@app.route("/api/trips/<int:tid>/points/add", methods=["POST"])
+def api_point_add(tid):
+    require_admin()
+    b = request.get_json(force=True, silent=True) or {}
+    lat, lon, ts = b.get("lat"), b.get("lon"), b.get("ts")
+    if lat is None or lon is None or ts is None:
+        abort(400)
+    row = dbx("INSERT INTO trips.track_point(trip_id, ts, lat, lon, source) "
+              "VALUES (%s, to_timestamp(%s), %s, %s, 'edited') RETURNING id",
+              (tid, float(ts), lat, lon), fetch="one")
+    dbx(BACKFILL_DIST_SQL)
+    return jsonify({"id": int(row[0])})
+
+
+@app.route("/api/trips/<int:tid>/points/join", methods=["POST"])
+def api_point_join(tid):
+    """Bridge two segment endpoints with a straight line of interpolated points (ts linearly spread), so the
+    gap between them renders as one continuous track. Bridge points are source='filled' (drawn dotted)."""
+    require_admin()
+    b = request.get_json(force=True, silent=True) or {}
+    ia, ib = b.get("id_a"), b.get("id_b")
+    if ia is None or ib is None:
+        abort(400)
+    rows = dbx("SELECT id, EXTRACT(EPOCH FROM ts) AS ts, lat, lon FROM trips.track_point "
+               "WHERE trip_id=%s AND id IN (%s,%s)", (tid, int(ia), int(ib)), fetch="all", dict_cur=True)
+    if not rows or len(rows) != 2:
+        abort(404)
+    a, c = sorted(rows, key=lambda r: float(r["ts"]))
+    ta, tc = float(a["ts"]), float(c["ts"])
+    d = gapfill.hav(a["lat"], a["lon"], c["lat"], c["lon"])
+    n = max(2, int(d // 40) + 1)
+    pts = []
+    for k in range(1, n):
+        f = k / n
+        pts.append((ta + f * (tc - ta), a["lat"] + f * (c["lat"] - a["lat"]), a["lon"] + f * (c["lon"] - a["lon"]), None))
+    added = _insert_filled(tid, pts)
+    dbx(BACKFILL_DIST_SQL)
+    return jsonify({"ok": True, "added": added})
+
+
+@app.route("/api/trips/<int:tid>/points/densify", methods=["POST"])
+def api_point_densify(tid):
+    """Fill the big gaps WITHIN the ts-span of the selected points: every track segment longer than
+    min_gap_m inside that span gets interpolated points (source='filled') spaced ~spacing_m."""
+    require_admin()
+    body = request.get_json(force=True, silent=True) or {}
+    ids = body.get("ids") or []
+    if len(ids) < 2:
+        abort(400)
+    ids = [int(x) for x in ids]
+    spacing = max(5.0, float(body.get("spacing_m") or 25))
+    min_gap = max(spacing, float(body.get("min_gap_m") or 40))
+    sel = dbx("SELECT EXTRACT(EPOCH FROM ts) AS ts FROM trips.track_point WHERE trip_id=%s AND id = ANY(%s)",
+              (tid, ids), fetch="all")
+    if not sel:
+        abort(404)
+    tss = [float(r[0]) for r in sel]
+    tmin, tmax = min(tss), max(tss)
+    rows = dbx("SELECT EXTRACT(EPOCH FROM ts) AS ts, lat, lon FROM trips.track_point "
+               "WHERE trip_id=%s AND ts BETWEEN to_timestamp(%s) AND to_timestamp(%s) ORDER BY ts, id",
+               (tid, tmin, tmax), fetch="all", dict_cur=True)
+    pts = []
+    for i in range(1, len(rows)):
+        a, c = rows[i - 1], rows[i]
+        ta, tc = float(a["ts"]), float(c["ts"])
+        d = gapfill.hav(a["lat"], a["lon"], c["lat"], c["lon"])
+        if d <= min_gap:
+            continue
+        n = max(2, int(d // spacing) + 1)
+        for k in range(1, n):
+            f = k / n
+            pts.append((ta + f * (tc - ta), a["lat"] + f * (c["lat"] - a["lat"]), a["lon"] + f * (c["lon"] - a["lon"]), None))
+    added = _insert_filled(tid, pts) if pts else 0
+    if pts:
+        dbx(BACKFILL_DIST_SQL)
+    return jsonify({"ok": True, "added": added})
+
+
 @app.route("/api/trips/<int:tid>/photos")
 def api_photos(tid):
+    admin = request_is_admin()
+    if not admin and trip_is_hidden(tid):
+        return jsonify([])
     since = int(request.args.get("since_id") or 0)
+    # non-admin (e.g. the direct :8099 web viewer, view-only) sees ONLY World-tagged photos; admin sees all
+    world = "" if admin else (" AND EXISTS(SELECT 1 FROM trips.photo_tag pw "
+                              "WHERE pw.immich_asset_id=p.immich_asset_id AND pw.tag='World')")
     rows = dbx(
-        "SELECT id, immich_asset_id, EXTRACT(EPOCH FROM capture_ts) AS cts, lat, lon, matched_by, original_filename, media_type, camera, people "
-        "FROM trips.photo WHERE trip_id=%s AND id>%s AND lat IS NOT NULL ORDER BY id",
+        "SELECT p.id, p.immich_asset_id, EXTRACT(EPOCH FROM p.capture_ts) AS cts, p.lat, p.lon, p.matched_by, "
+        "p.original_filename, p.media_type, p.camera, p.people, "
+        "(SELECT array_agg(pt.tag) FROM trips.photo_tag pt WHERE pt.immich_asset_id=p.immich_asset_id) AS tags "
+        "FROM trips.photo p WHERE p.trip_id=%s AND p.id>%s AND p.lat IS NOT NULL" + world + " ORDER BY p.id",
         (tid, since),
         fetch="all",
         dict_cur=True,
@@ -839,16 +1186,293 @@ def api_photos(tid):
                 "type": r.get("media_type") or "image",
                 "camera": r.get("camera"),
                 "people": _people(r.get("people")),
+                "tags": r.get("tags") or [],
             }
             for r in rows
         ]
     )
 
 
+def _export_rows(tid):
+    trip = dbx("SELECT name FROM trips.trip WHERE id=%s", (tid,), fetch="one", dict_cur=True)
+    if not trip:
+        abort(404)
+    rows = dbx(
+        "SELECT EXTRACT(EPOCH FROM ts) AS ts, lat, lon, altitude, speed "
+        "FROM trips.track_point WHERE trip_id=%s ORDER BY ts, id",
+        (tid,), fetch="all", dict_cur=True,
+    )
+    name = trip["name"] or f"Trip {tid}"
+    fname = (re.sub(r"[^A-Za-z0-9._-]+", "_", name)[:60] or f"trip_{tid}")
+    return name, fname, rows
+
+
+@app.route("/api/trips/<int:tid>/export.gpx")
+def api_export_gpx(tid):
+    if not request_is_admin() and trip_is_hidden(tid):
+        abort(404)
+    name, fname, rows = _export_rows(tid)
+    out = ['<?xml version="1.0" encoding="UTF-8"?>',
+           '<gpx version="1.1" creator="Trip Tracker" xmlns="http://www.topografix.com/GPX/1/1">',
+           f"<trk><name>{html.escape(name)}</name><trkseg>"]
+    prev = None
+    for r in rows:
+        ts = float(r["ts"])
+        if prev is not None and ts - prev > 60:   # a data gap → start a new track segment
+            out.append("</trkseg><trkseg>")
+        prev = ts
+        p = f'<trkpt lat="{r["lat"]}" lon="{r["lon"]}">'
+        if r["altitude"] is not None:
+            p += f"<ele>{r['altitude']}</ele>"
+        p += "<time>" + dt.datetime.fromtimestamp(ts, dt.timezone.utc).isoformat().replace("+00:00", "Z") + "</time></trkpt>"
+        out.append(p)
+    out.append("</trkseg></trk></gpx>")
+    return Response("\n".join(out), content_type="application/gpx+xml",
+                    headers={"Content-Disposition": f'attachment; filename="{fname}.gpx"'})
+
+
+@app.route("/api/trips/<int:tid>/export.geojson")
+def api_export_geojson(tid):
+    if not request_is_admin() and trip_is_hidden(tid):
+        abort(404)
+    name, fname, rows = _export_rows(tid)
+    coords = []
+    for r in rows:
+        c = [r["lon"], r["lat"]]
+        if r["altitude"] is not None:
+            c.append(r["altitude"])
+        coords.append(c)
+    feats = [{"type": "Feature", "properties": {"name": name, "kind": "track"},
+              "geometry": {"type": "LineString", "coordinates": coords}}]
+    phs = dbx(
+        "SELECT immich_asset_id, lat, lon, camera FROM trips.photo WHERE trip_id=%s AND lat IS NOT NULL ORDER BY id",
+        (tid,), fetch="all", dict_cur=True,
+    )
+    for ph in phs:
+        feats.append({"type": "Feature",
+                      "properties": {"kind": "photo", "asset": ph["immich_asset_id"], "camera": ph.get("camera")},
+                      "geometry": {"type": "Point", "coordinates": [ph["lon"], ph["lat"]]}})
+    body = json.dumps({"type": "FeatureCollection", "features": feats})
+    return Response(body, content_type="application/geo+json",
+                    headers={"Content-Disposition": f'attachment; filename="{fname}.geojson"'})
+
+
 @app.route("/api/trips/<int:tid>/sync_photos", methods=["POST"])
 def api_sync(tid):
     require_admin()
     return jsonify(sync_photos(tid))
+
+
+# ---------------------------------------------------------------- photo visibility tags (admin)
+TAGS = {"Relatives", "World"}
+SCOPE_TAG = {"relatives": "Relatives", "world": "World"}   # share scope -> required photo tag
+
+# Mirror visibility tags into immich as real immich tags (so they show up / are managed there too). The
+# add-on's trips.photo_tag table stays the fast source for share filtering + the app; immich is kept in sync.
+_immich_tag_ids = {}
+_immich_tag_lock = threading.Lock()
+
+
+def _immich_tag_id(name):
+    with _immich_tag_lock:
+        if name in _immich_tag_ids:
+            return _immich_tag_ids[name]
+    if not IMMICH_KEY:
+        return None
+    try:
+        r = requests.put(f"{IMMICH_URL}/api/tags",
+                         headers={"x-api-key": IMMICH_KEY, "Content-Type": "application/json"},
+                         json={"tags": [name]}, timeout=15)
+        if r.status_code == 200:
+            for t in r.json():
+                if t.get("name") == name:
+                    with _immich_tag_lock:
+                        _immich_tag_ids[name] = t["id"]
+                    return t["id"]
+    except Exception as e:
+        log.warning("immich tag upsert failed: %s", e)
+    return None
+
+
+def _immich_tag_asset(asset, name, on):
+    """Best-effort: add/remove an immich tag on an asset. Never fails the caller (the local table is authoritative)."""
+    tid = _immich_tag_id(name)
+    if not tid:
+        return False
+    try:
+        url = f"{IMMICH_URL}/api/tags/{tid}/assets"
+        hdr = {"x-api-key": IMMICH_KEY, "Content-Type": "application/json"}
+        r = (requests.put(url, headers=hdr, json={"ids": [asset]}, timeout=15) if on
+             else requests.delete(url, headers=hdr, json={"ids": [asset]}, timeout=15))
+        return r.status_code == 200
+    except Exception as e:
+        log.warning("immich tag asset update failed: %s", e)
+        return False
+
+
+def _backfill_immich_tags():
+    """Push every existing local tag into immich at boot (idempotent) so tags created before this feature
+    (or while immich was unreachable) still appear in immich."""
+    try:
+        rows = dbx("SELECT immich_asset_id, tag FROM trips.photo_tag", fetch="all", dict_cur=True) or []
+        for r in rows:
+            _immich_tag_asset(r["immich_asset_id"], r["tag"], True)
+            time.sleep(0.05)
+        if rows:
+            log.info("immich tag backfill pushed %d rows", len(rows))
+    except Exception as e:
+        log.warning("immich tag backfill failed: %s", e)
+
+
+def _immich_delete_asset(asset):
+    """Move an immich asset to trash (force=False, recoverable). Best-effort."""
+    if not IMMICH_KEY:
+        return False
+    try:
+        r = requests.delete(f"{IMMICH_URL}/api/assets",
+                            headers={"x-api-key": IMMICH_KEY, "Content-Type": "application/json"},
+                            json={"ids": [asset], "force": False}, timeout=20)
+        return r.status_code in (200, 204)
+    except Exception as e:
+        log.warning("immich asset delete failed: %s", e)
+        return False
+
+
+@app.route("/api/photo/<asset>", methods=["DELETE"])
+def api_photo_delete(asset):
+    require_admin()
+    ok = _immich_delete_asset(asset)                                  # move to immich trash
+    dbx("DELETE FROM trips.photo WHERE immich_asset_id=%s", (asset,))  # drop the marker(s)
+    dbx("DELETE FROM trips.photo_tag WHERE immich_asset_id=%s", (asset,))
+    return jsonify({"ok": True, "immich": ok})
+
+
+@app.route("/api/photo/<asset>/tag", methods=["POST"])
+def api_photo_tag(asset):
+    require_admin()
+    body = request.get_json(force=True, silent=True) or {}
+    tag = body.get("tag"); on = bool(body.get("on"))
+    if tag not in TAGS:
+        abort(400)
+    if on:
+        dbx("INSERT INTO trips.photo_tag(immich_asset_id, tag) VALUES (%s,%s) ON CONFLICT DO NOTHING", (asset, tag))
+    else:
+        dbx("DELETE FROM trips.photo_tag WHERE immich_asset_id=%s AND tag=%s", (asset, tag))
+    _immich_tag_asset(asset, tag, on)   # mirror into immich (best-effort; local table is authoritative)
+    return jsonify({"ok": True})
+
+
+# ---------------------------------------------------------------- public share links (token-gated, read-only)
+# Each share link is scoped: "relatives" shows only photos tagged 'Relatives', "world" only 'World'.
+# A photo tagged with neither never appears in any share. The admin UI (authenticated) still sees all photos.
+@app.route("/api/trips/<int:tid>/share", methods=["POST"])
+def api_share(tid):
+    require_admin()
+    body = request.get_json(force=True, silent=True) or {}
+    scope = body.get("scope")
+    if scope not in SCOPE_TAG:
+        abort(400)
+    if not dbx("SELECT 1 FROM trips.trip WHERE id=%s", (tid,), fetch="one"):
+        abort(404)
+    row = dbx("SELECT token FROM trips.share WHERE trip_id=%s AND scope=%s", (tid, scope), fetch="one")
+    token = row[0] if row else secrets.token_urlsafe(24)
+    if not row:
+        dbx("INSERT INTO trips.share(token, trip_id, scope) VALUES (%s,%s,%s)", (token, tid, scope))
+    return jsonify({"token": token, "scope": scope, "url": SHARE_BASE.rstrip("/") + "/share/" + token})
+
+
+@app.route("/api/trips/<int:tid>/shares")
+def api_shares(tid):
+    require_admin()
+    rows = dbx("SELECT scope, token FROM trips.share WHERE trip_id=%s", (tid,), fetch="all") or []
+    base = SHARE_BASE.rstrip("/")
+    return jsonify({r[0]: {"token": r[1], "url": base + "/share/" + r[1]} for r in rows})
+
+
+@app.route("/api/trips/<int:tid>/unshare", methods=["POST"])
+def api_unshare(tid):
+    require_admin()
+    body = request.get_json(force=True, silent=True) or {}
+    scope = body.get("scope")
+    if scope not in SCOPE_TAG:
+        abort(400)
+    dbx("DELETE FROM trips.share WHERE trip_id=%s AND scope=%s", (tid, scope))
+    return jsonify({"ok": True})
+
+
+def _trip_by_token(token):
+    if not token:
+        return None
+    return dbx("SELECT t.id, t.name, t.color, t.active, t.distance_m, s.scope "
+               "FROM trips.share s JOIN trips.trip t ON t.id=s.trip_id WHERE s.token=%s",
+               (token,), fetch="one", dict_cur=True)
+
+
+@app.route("/share/<token>")
+def share_page(token):
+    if not _trip_by_token(token):
+        abort(404)
+    return send_from_directory(app.static_folder, "share.html")
+
+
+@app.route("/share/<token>/data")
+def share_data(token):
+    t = _trip_by_token(token)
+    if not t:
+        abort(404)
+    tid = int(t["id"]); tag = SCOPE_TAG.get(t.get("scope"))
+    tr = dbx("SELECT id, EXTRACT(EPOCH FROM ts) AS ts, lat, lon FROM trips.track_point WHERE trip_id=%s ORDER BY ts, id",
+             (tid,), fetch="all", dict_cur=True)
+    ph = dbx("SELECT p.id, p.immich_asset_id, p.lat, p.lon FROM trips.photo p WHERE p.trip_id=%s AND p.lat IS NOT NULL "
+             "AND EXISTS(SELECT 1 FROM trips.photo_tag pt WHERE pt.immich_asset_id=p.immich_asset_id AND pt.tag=%s) ORDER BY p.id",
+             (tid, tag), fetch="all", dict_cur=True)
+    return jsonify({
+        "name": t["name"], "color": t.get("color"), "active": t["active"],
+        "distance_m": round(float(t.get("distance_m") or 0), 1),
+        "google_key": GOOGLE_KEY,   # same key the web viewer uses (referrer-restricted to this domain)
+        "track": [{"id": int(r["id"]), "ts": float(r["ts"]), "lat": r["lat"], "lon": r["lon"]} for r in tr],
+        "photos": [{"id": int(r["id"]), "asset": r["immich_asset_id"], "lat": r["lat"], "lon": r["lon"]} for r in ph],
+    })
+
+
+@app.route("/share/<token>/track")
+def share_track(token):
+    t = _trip_by_token(token)
+    if not t:
+        abort(404)
+    since = int(request.args.get("since_id") or 0)
+    tr = dbx("SELECT id, EXTRACT(EPOCH FROM ts) AS ts, lat, lon FROM trips.track_point WHERE trip_id=%s AND id>%s ORDER BY ts, id",
+             (int(t["id"]), since), fetch="all", dict_cur=True)
+    return jsonify([{"id": int(r["id"]), "ts": float(r["ts"]), "lat": r["lat"], "lon": r["lon"]} for r in tr])
+
+
+@app.route("/share/<token>/photos")
+def share_photos(token):
+    t = _trip_by_token(token)
+    if not t:
+        abort(404)
+    since = int(request.args.get("since_id") or 0); tag = SCOPE_TAG.get(t.get("scope"))
+    ph = dbx("SELECT p.id, p.immich_asset_id, p.lat, p.lon FROM trips.photo p WHERE p.trip_id=%s AND p.id>%s AND p.lat IS NOT NULL "
+             "AND EXISTS(SELECT 1 FROM trips.photo_tag pt WHERE pt.immich_asset_id=p.immich_asset_id AND pt.tag=%s) ORDER BY p.id",
+             (int(t["id"]), since, tag), fetch="all", dict_cur=True)
+    return jsonify([{"id": int(r["id"]), "asset": r["immich_asset_id"], "lat": r["lat"], "lon": r["lon"]} for r in ph])
+
+
+@app.route("/share/<token>/photo/<asset>/<size>")
+def share_photo(token, asset, size):
+    t = _trip_by_token(token)
+    if not t:
+        abort(404)
+    # the asset MUST belong to this trip AND carry this share's tag — stops the token fetching arbitrary
+    # immich assets, or a photo not meant for this audience (e.g. a 'World' token pulling a 'Relatives' photo)
+    tag = SCOPE_TAG.get(t.get("scope"))
+    if not dbx("SELECT 1 FROM trips.photo p JOIN trips.photo_tag pt ON pt.immich_asset_id=p.immich_asset_id "
+               "WHERE p.trip_id=%s AND p.immich_asset_id=%s AND pt.tag=%s LIMIT 1",
+               (int(t["id"]), asset, tag), fetch="one"):
+        abort(404)
+    if size == "original":
+        return _immich_proxy(f"/api/assets/{asset}/original", {})
+    return _immich_proxy(f"/api/assets/{asset}/thumbnail", {"size": "preview" if size == "preview" else "thumbnail"})
 
 
 def _immich_proxy(path, params):
@@ -889,26 +1513,39 @@ def _immich_proxy_range(path):
     return Response(r.iter_content(64 * 1024), status=r.status_code, headers=out)
 
 
+def _nonadmin_may_see(asset):
+    """Non-admin photo access (e.g. the direct :8099 viewer) is limited to World-tagged assets, matching
+    the api_photos filter — so a non-admin can't fetch an untagged/Relatives-only photo by guessing its id."""
+    if request_is_admin():
+        return True
+    return bool(dbx("SELECT 1 FROM trips.photo_tag WHERE immich_asset_id=%s AND tag='World' LIMIT 1",
+                    (asset,), fetch="one"))
+
+
 @app.route("/api/photo/<asset>/video")
 def api_video(asset):
+    if not _nonadmin_may_see(asset): abort(404)
     # immich-transcoded playback stream (range-aware → seekable in <video>)
     return _immich_proxy_range(f"/api/assets/{asset}/video/playback")
 
 
 @app.route("/api/photo/<asset>/thumbnail")
 def api_thumb(asset):
+    if not _nonadmin_may_see(asset): abort(404)
     # small + fast — used for the marker popup image
     return _immich_proxy(f"/api/assets/{asset}/thumbnail", {"size": "thumbnail"})
 
 
 @app.route("/api/photo/<asset>/preview")
 def api_preview(asset):
+    if not _nonadmin_may_see(asset): abort(404)
     # larger (~1440px) — used for the full-screen lightbox
     return _immich_proxy(f"/api/assets/{asset}/thumbnail", {"size": "preview"})
 
 
 @app.route("/api/photo/<asset>/original")
 def api_original(asset):
+    if not _nonadmin_may_see(asset): abort(404)
     return _immich_proxy(f"/api/assets/{asset}/original", {})
 
 
@@ -917,6 +1554,7 @@ def main():
     bootstrap_schema()
     start_mqtt()
     threading.Thread(target=poller, daemon=True).start()
+    threading.Thread(target=_backfill_immich_tags, daemon=True).start()
     from waitress import serve
 
     # :8098 is proxied by HA ingress; :8099 is published as a host port for direct access outside HA.

@@ -61,6 +61,10 @@ export TT_HA_TOKEN="${HA_TOKEN}"
 export TT_IMMICH_URL="${IMMICH_URL}"
 export TT_IMMICH_KEY="${IMMICH_KEY}"
 export TT_GOOGLE_MAPS_KEY="$(bashio::config 'google_maps_key')"
+# Native-app admin token: prefer the add-on option; fall back to secrets.yaml (trip_tracker_app_token).
+APP_TOKEN="$(bashio::config 'app_token')"
+if bashio::var.is_empty "${APP_TOKEN}"; then APP_TOKEN="$(secret trip_tracker_app_token)"; fi
+export TT_APP_TOKEN="${APP_TOKEN}"
 export TT_MQTT_HOST="${MQTT_HOST}"
 export TT_MQTT_PORT="${MQTT_PORT}"
 export TT_MQTT_USER="${MQTT_USER}"

@@ -1,0 +1,87 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=4">
+  <title>Trip Tracker — shared trip</title>
+  <style>
+    html, body, #map { height: 100%; margin: 0; }
+    #hdr {
+      position: absolute; z-index: 1000; top: 8px; left: 8px;
+      background: rgba(13,17,23,.85); color: #fff; padding: 8px 12px;
+      border-radius: 8px; font: 14px system-ui, sans-serif; max-width: 80vw;
+    }
+  </style>
+</head>
+<body>
+  <div id="hdr">Loading…</div>
+  <div id="map"></div>
+  <script>
+    const token = location.pathname.split('/share/')[1].split('/')[0];
+    const base = '/share/' + token;
+    const hdr = document.getElementById('hdr');
+    const path = [], haveAssets = new Set();
+    let map, poly, info, lastPt = 0, lastPh = 0, active = false;
+    const j = (u) => fetch(u).then(r => { if (!r.ok) throw new Error(r.status); return r.json(); });
+    const fmtDist = (m) => m >= 1000 ? (m / 1000).toFixed(1) + ' km' : Math.round(m) + ' m';
+
+    async function start() {
+      let d;
+      try { d = await j(base + '/data'); }
+      catch (e) { hdr.textContent = 'This trip link is not found or has been revoked.'; return; }
+      window.__d = d;
+      if (!d.google_key) { hdr.textContent = 'No map key is configured on the server.'; return; }
+      window.__ttInit = () => build(d);
+      const s = document.createElement('script');
+      s.src = 'https://maps.googleapis.com/maps/api/js?key=' + encodeURIComponent(d.google_key) + '&callback=__ttInit';
+      s.async = true; s.defer = true;
+      s.onerror = () => { hdr.textContent = 'Google Maps failed to load (check the key / referrer).'; };
+      document.head.appendChild(s);
+    }
+
+    function addPhoto(ph) {
+      if (haveAssets.has(ph.asset)) return; haveAssets.add(ph.asset);
+      const m = new google.maps.Marker({
+        map, position: { lat: ph.lat, lng: ph.lon },
+        icon: { path: google.maps.SymbolPath.CIRCLE, scale: 6, fillColor: '#c9d1d9', fillOpacity: 1, strokeColor: '#5b636e', strokeWeight: 2 },
+      });
+      m.addListener('click', () => {
+        info.setContent('<img src="' + base + '/photo/' + encodeURIComponent(ph.asset) + '/preview" style="width:260px;max-width:70vw;display:block">');
+        info.open(map, m);
+      });
+    }
+
+    function build(d) {
+      active = !!d.active;
+      hdr.textContent = (d.name || 'Trip') + ' · ' + fmtDist(d.distance_m || 0) + (active ? ' · live' : '');
+      map = new google.maps.Map(document.getElementById('map'), { mapTypeId: 'roadmap', streetViewControl: false, mapTypeControl: true, fullscreenControl: true });
+      // control: recenter on the current / last track point
+      const ctr = document.createElement('button');
+      ctr.type = 'button'; ctr.title = 'Center on latest point'; ctr.textContent = '◎';
+      ctr.style.cssText = 'margin:10px;width:40px;height:40px;border:0;border-radius:4px;background:#fff;' +
+        'box-shadow:0 1px 4px rgba(0,0,0,.3);font-size:22px;line-height:40px;cursor:pointer;color:#1565c0';
+      ctr.onclick = () => { if (path.length) { map.panTo(path[path.length - 1]); map.setZoom(Math.max(map.getZoom(), 16)); } };
+      map.controls[google.maps.ControlPosition.RIGHT_BOTTOM].push(ctr);
+      poly = new google.maps.Polyline({ map, strokeColor: d.color || '#1565c0', strokeWeight: 5, strokeOpacity: 0.9 });
+      info = new google.maps.InfoWindow();
+      const b = new google.maps.LatLngBounds();
+      for (const p of d.track) { const ll = { lat: p.lat, lng: p.lon }; path.push(ll); b.extend(ll); if (p.id > lastPt) lastPt = p.id; }
+      poly.setPath(path);
+      for (const ph of d.photos) { addPhoto(ph); if (ph.id > lastPh) lastPh = ph.id; }
+      if (path.length) map.fitBounds(b); else { map.setCenter({ lat: 20, lng: 78 }); map.setZoom(4); }
+      if (active) setInterval(poll, 6000);
+    }
+
+    async function poll() {
+      try {
+        const tr = await j(base + '/track?since_id=' + lastPt);
+        for (const p of tr) { path.push({ lat: p.lat, lng: p.lon }); if (p.id > lastPt) lastPt = p.id; }
+        if (tr.length) poly.setPath(path);
+        const ph = await j(base + '/photos?since_id=' + lastPh);
+        for (const p of ph) { addPhoto(p); if (p.id > lastPh) lastPh = p.id; }
+      } catch (e) {}
+    }
+    start();
+  </script>
+</body>
+</html>
