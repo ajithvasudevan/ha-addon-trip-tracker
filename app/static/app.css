@@ -359,7 +359,7 @@ body.grid-open #map-grid, body.grid-open #speed-overlay { display: none; }   /* 
 .pg-tag.on.rel { background: #1565C0; border-color: #1565C0; }
 .pg-tag.on.world { background: #E53935; border-color: #E53935; }
 /* dock tag buttons */
-.pv-tags { position: absolute; left: 8px; top: 8px; z-index: 6; display: flex; gap: 8px; }
+.pv-tags { position: absolute; left: 8px; right: 94px; top: 8px; z-index: 6; display: flex; flex-wrap: wrap; gap: 8px; }  /* right:94 reserves the top-right ⛶ + ✕; wrap instead of running under them on a narrow pane */
 .pv-tag { width: 112px; flex: 0 0 auto; white-space: nowrap; text-align: center; font-size: 12px; padding: 9px 8px; border-radius: 7px; border: 1.5px solid rgba(255,255,255,.65); background: rgba(0,0,0,.5); color: #fff; cursor: pointer; }
 .pv-tag.on[data-tag="Relatives"] { background: #1565C0; border-color: #1565C0; }
 .pv-tag.on[data-tag="World"] { background: #E53935; border-color: #E53935; }
@@ -443,3 +443,53 @@ body.portrait #panel {
 body.portrait #mapwrap { flex: none; width: 100%; height: 100%; min-height: 0; } /* dock closed → full height */
 body.portrait.pv-open #mapwrap { height: 60%; }                                  /* dock open → top 60% */
 body.portrait.pv-open #photodock { flex: none; height: 40%; width: 100%; }       /* dock open → bottom 40% */
+
+
+/* ---- alert zones (admin) ---- */
+.ptab-page[data-page="zones"]:not([hidden]) { display:flex; flex-direction:column; min-height:0; }
+#zone-crosshair { position:absolute; left:50%; top:50%; width:14px; height:14px; margin:-7px 0 0 -7px; border-radius:50%; background:#8b0000; border:2px solid #fff; box-shadow:0 0 0 1px #0006; pointer-events:none; z-index:500; }
+#zone-placer { position:absolute; left:10px; right:10px; bottom:10px; max-width:460px; margin:0 auto; background:#0d1117; border:1px solid #30363d; border-radius:10px; padding:10px; z-index:600; box-shadow:0 4px 18px #000a; }
+#zone-placer input[type=text], #zone-placer input[type=number] { background:#161b22; color:#e6edf3; border:1px solid #30363d; border-radius:6px; padding:6px 8px; }
+#zone-placer #zpf-name { width:100%; box-sizing:border-box; margin-bottom:8px; }
+#zone-placer #zpf-radius { width:80px; }
+.zpf-row { display:flex; align-items:center; gap:14px; color:#e6edf3; flex-wrap:wrap; }
+.zpf-row.zpf-actions { margin-top:10px; gap:8px; }
+.zpf-row label { display:flex; align-items:center; gap:5px; }
+.zone-head { display:flex; gap:8px; padding:10px 10px 6px; align-items:center; }
+.zone-head #zone-search { flex:1; min-width:0; background:#161b22; color:#e6edf3; border:1px solid #30363d; border-radius:6px; padding:7px 9px; }
+.zone-list { list-style:none; margin:0; padding:0 6px; overflow:auto; flex:1; }
+.zone-row { display:flex; align-items:center; border-bottom:1px solid #ffffff14; }
+.zone-row .zone-main { flex:1; padding:9px 6px; cursor:pointer; min-width:0; }
+.zone-row .zone-name { color:#e6edf3; font-size:14px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.zone-row .zone-sub { color:#9aa5b1; font-size:12px; }
+.zone-row .zone-btn { background:none; border:none; color:#9aa5b1; font-size:16px; padding:8px 10px; cursor:pointer; }
+.zone-row .zone-btn:hover { color:#e6edf3; }
+.zone-empty { color:#9aa5b1; padding:12px; }
+
+/* zone layout fixes: override the app's base `button { width:100% }` which breaks our flex rows/header */
+.zone-head #zone-search { margin: 0; }
+.zone-head #zone-add { width: auto; flex: 0 0 auto; white-space: nowrap; }
+.zone-row .zone-btn { width: auto; flex: 0 0 auto; }
+#zone-placer button { width: auto; flex: 0 0 auto; }
+#zone-placer .zpf-actions { flex-wrap: nowrap; }
+
+/* ---- alert-zone place search (admin) ---- */
+#zone-lens { position:absolute; top:10px; left:52px; z-index:550; width:40px; height:40px; padding:0;
+  border-radius:8px; background:#0d1117cc; border:1px solid #30363d; color:#fff; font-size:18px; line-height:38px; cursor:pointer; }
+#zone-search-bar { position:absolute; top:10px; left:10px; right:10px; max-width:460px; z-index:560;
+  background:#0d1117; border:1px solid #30363d; border-radius:10px; box-shadow:0 4px 18px #000a; }
+#zone-search-bar #zps-input { width:calc(100% - 42px); background:transparent; color:#e6edf3; border:none;
+  padding:11px 10px; margin:0; font-size:15px; outline:none; box-sizing:border-box; }
+#zone-search-bar #zps-close { position:absolute; top:4px; right:4px; width:36px; height:36px; padding:0;
+  background:none; border:none; color:#9aa5b1; font-size:15px; cursor:pointer; }
+#zps-results { max-height:52vh; overflow:auto; }
+#zps-results .zps-row { display:flex; align-items:center; padding:9px 10px; border-top:1px solid #ffffff14; cursor:pointer; }
+#zps-results .zps-row:hover { background:#161b22; }
+#zps-results .zps-histmain { flex:1; min-width:0; }
+#zps-results .zps-main { color:#e6edf3; font-size:14px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+#zps-results .zps-sub { color:#9aa5b1; font-size:12px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+#zps-results .zps-empty { color:#9aa5b1; padding:10px; }
+#zps-results .zps-x { background:none; border:none; color:#9aa5b1; font-size:15px; width:auto; flex:0 0 auto; padding:6px 10px; cursor:pointer; }
+#zps-results .zps-x:hover { color:#e6edf3; }
+.zps-pin { background:none; border:none; }
+.zps-pin-in { width:16px; height:16px; background:#1a73e8; border:2px solid #fff; border-radius:50%; box-shadow:0 1px 3px #0007; }

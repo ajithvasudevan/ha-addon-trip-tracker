@@ -1,5 +1,5 @@
 name: Trip Tracker
-version: "1.0.1"
+version: "1.0.7"
 slug: trip-tracker
 description: Live trip map — a GPS track that grows as you travel (fed by the MyMessages app over MQTT) plus immich photo markers, stored in the recorder Postgres.
 url: "https://github.com/ajithvasudevan/ha-config"
@@ -12,7 +12,7 @@ ingress: true
 ingress_port: 8098
 panel_icon: mdi:map-marker-path
 panel_title: Trip Tracker
-panel_admin: false
+panel_admin: true
 ports:
   8099/tcp: 8099
 ports_description:

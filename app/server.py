@@ -210,6 +210,19 @@ CREATE TABLE IF NOT EXISTS trips.share (
   created_at timestamptz NOT NULL DEFAULT now(),
   UNIQUE (trip_id, scope)
 );
+-- user alert zones (geofences): the shared source of truth for the web + native app;
+-- the native app does the device-side background alerting from these.
+CREATE TABLE IF NOT EXISTS trips.zone (
+  id            serial PRIMARY KEY,
+  lat           double precision NOT NULL,
+  lon           double precision NOT NULL,
+  radius_m      double precision NOT NULL,
+  notify_enter  boolean NOT NULL DEFAULT true,
+  notify_exit   boolean NOT NULL DEFAULT false,
+  name          text NOT NULL DEFAULT '',
+  created_at    timestamptz NOT NULL DEFAULT now(),
+  updated_at    timestamptz NOT NULL DEFAULT now()
+);
 """
 
 
@@ -895,6 +908,68 @@ def api_basemap():
             s["basemap"] = key
             _save_state(s)
     return jsonify({"ok": True, "basemap": admin_basemap()})
+
+
+# --------------------------------------------------------------------------- alert zones (admin only)
+def _zone_row(r):
+    return {"id": r["id"], "lat": r["lat"], "lon": r["lon"], "radius_m": r["radius_m"],
+            "enter": r["notify_enter"], "exit": r["notify_exit"], "name": r["name"] or ""}
+
+ZONE_COLS = "id,lat,lon,radius_m,notify_enter,notify_exit,name"
+
+@app.route("/api/zones")
+def api_zones():
+    require_admin()
+    rows = dbx(f"SELECT {ZONE_COLS} FROM trips.zone ORDER BY id", fetch="all", dict_cur=True) or []
+    return jsonify([_zone_row(r) for r in rows])
+
+@app.route("/api/zones", methods=["POST"])
+def api_zone_create():
+    require_admin()
+    b = request.get_json(force=True, silent=True) or {}
+    try:
+        lat = float(b["lat"]); lon = float(b["lon"]); rad = float(b["radius_m"])
+    except (KeyError, TypeError, ValueError):
+        abort(400)
+    if rad <= 0:
+        abort(400)
+    enter = bool(b.get("enter", True)); exit_ = bool(b.get("exit", False))
+    name = (str(b.get("name") or "")).strip()[:200]
+    row = dbx(f"INSERT INTO trips.zone(lat,lon,radius_m,notify_enter,notify_exit,name) "
+              f"VALUES (%s,%s,%s,%s,%s,%s) RETURNING {ZONE_COLS}",
+              (lat, lon, rad, enter, exit_, name), fetch="one", dict_cur=True)
+    return jsonify(_zone_row(row))
+
+@app.route("/api/zones/<int:zid>", methods=["POST", "PUT"])
+def api_zone_update(zid):
+    require_admin()
+    b = request.get_json(force=True, silent=True) or {}
+    sets, params = [], []
+    spec = [("lat", "lat", float), ("lon", "lon", float), ("radius_m", "radius_m", float),
+            ("enter", "notify_enter", bool), ("exit", "notify_exit", bool),
+            ("name", "name", lambda v: (str(v or "")).strip()[:200])]
+    for key, col, conv in spec:
+        if key in b:
+            try:
+                val = conv(b[key])
+            except (TypeError, ValueError):
+                abort(400)
+            sets.append(f"{col}=%s"); params.append(val)
+    if sets:
+        sets.append("updated_at=now()"); params.append(zid)
+        row = dbx(f"UPDATE trips.zone SET {', '.join(sets)} WHERE id=%s RETURNING {ZONE_COLS}",
+                  tuple(params), fetch="one", dict_cur=True)
+    else:
+        row = dbx(f"SELECT {ZONE_COLS} FROM trips.zone WHERE id=%s", (zid,), fetch="one", dict_cur=True)
+    if not row:
+        abort(404)
+    return jsonify(_zone_row(row))
+
+@app.route("/api/zones/<int:zid>", methods=["DELETE"])
+def api_zone_delete(zid):
+    require_admin()
+    dbx("DELETE FROM trips.zone WHERE id=%s", (zid,))
+    return jsonify({"ok": True})
 
 
 @app.route("/api/trips/<int:tid>/rename", methods=["POST"])

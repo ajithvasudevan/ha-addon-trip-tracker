@@ -20,6 +20,7 @@
         <button class="ptab active" data-tab="main">Trips</button>
         <button class="ptab" id="tab-start-btn" data-tab="start">Start a trip</button>
         <button class="ptab" data-tab="filter">Filter</button>
+        <button class="ptab" id="tab-zones-btn" data-tab="zones" hidden>Zones</button>
       </nav>
 
       <div class="ptab-page" data-page="main">
@@ -81,11 +82,39 @@
           </div>
         </div>
       </div>
+      <div class="ptab-page" data-page="zones" hidden>
+        <div class="zone-head">
+          <input id="zone-search" type="text" placeholder="Search zones">
+          <button id="zone-add" class="primary" title="Add a zone">＋ Add</button>
+        </div>
+        <ul id="zone-list" class="zone-list"></ul>
+      </div>
     </aside>
 
     <main id="mapwrap">
       <div id="map"></div>
       <div id="gmap"></div>
+      <button id="zone-lens" title="Search a place" hidden>🔍</button>
+      <div id="zone-search-bar" hidden>
+        <input id="zps-input" type="text" placeholder="Search a place" autocomplete="off">
+        <button id="zps-close" title="Close">✕</button>
+        <div id="zps-results"></div>
+      </div>
+      <div id="zone-crosshair" hidden></div>
+      <div id="zone-placer" hidden>
+        <input id="zpf-name" type="text" placeholder="Name (optional)">
+        <div class="zpf-row">
+          <label>Radius (m) <input id="zpf-radius" type="number" min="1" value="100"></label>
+          <label><input id="zpf-enter" type="checkbox" checked> Enter</label>
+          <label><input id="zpf-leave" type="checkbox"> Leave</label>
+        </div>
+        <div class="zpf-row zpf-actions">
+          <button id="zpf-delete" class="danger" style="display:none">Delete</button>
+          <span style="flex:1"></span>
+          <button id="zpf-cancel">Cancel</button>
+          <button id="zpf-save" class="primary">Save</button>
+        </div>
+      </div>
       <canvas id="edit-selcanvas"></canvas>
       <div id="edit-rubber"></div>
       <button id="panel-show" title="Show panel">▸</button>
@@ -245,5 +274,6 @@
   <script src="static/vendor/maplibre-gl.js"></script>
   <script src="static/vendor/leaflet-maplibre-gl.js"></script>
   <script src="static/app.js?v=__V__"></script>
+  <script src="static/zones.js?v=__V__"></script>
 </body>
 </html>

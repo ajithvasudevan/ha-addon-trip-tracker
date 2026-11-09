@@ -1036,7 +1036,8 @@ function openPhoto(key, fullscreen, fromSwipe) {
   if (i < 0) i = 0;
   curPhoto = Math.max(0, Math.min(i, photoSorted.length - 1));
   const p = photoSorted[curPhoto];
-  updatePhotoDots();          // current dot → yellow, rest → grey; no pan/zoom
+  if (typeof p.lat === "number" && typeof p.lon === "number") mapCenterOn(p.lat, p.lon, true);   // pan to follow the shown photo (zoom kept)
+  updatePhotoDots();          // current dot → yellow, rest → grey
   showDock(p, fromSwipe);
   if (fullscreen) showLightbox(p, fromSwipe);
   preloadAround(curPhoto);    // warm current ± neighbours so the next nav click paints instantly
